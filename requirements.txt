@@ -1,0 +1,61 @@
+# ─────────────────────────────────────────────────────────────
+# BioRAG — Decision-Support RAG System
+# ─────────────────────────────────────────────────────────────
+# Python >= 3.10 required (uses built-in type hints: list[str], dict[str, int])
+#
+# The core engine (core/rag_engine.py) has ZERO external dependencies.
+# Install only the groups you need.
+#
+# Usage:
+#   Core only:     no install needed
+#   API server:    pip install -r requirements.txt
+#   Full dev:      pip install -r requirements.txt -r requirements-dev.txt
+# ─────────────────────────────────────────────────────────────
+
+requests>=2.31.0              # For making HTTP requests (e.g. to LLM APIs)
+# ── API Server (server.py) ────────────────────────────────────
+# Required only if running the FastAPI REST server.
+
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0      # ASGI server with websockets + HTTP/2 support
+pydantic>=2.0.0                # Request/response validation (FastAPI dependency)
+
+
+# ── Optional: Dense Retrieval Upgrade ────────────────────────
+# Drop-in semantic search to replace or augment BM25.
+# Uncomment if you want embedding-based retrieval.
+
+sentence-transformers>=2.3.0   # Local embedding models (e.g. all-MiniLM-L6-v2)
+faiss-cpu>=1.7.4               # Vector index (CPU build; use faiss-gpu for GPU)
+numpy>=1.26.0                  # Required by faiss and sentence-transformers
+
+
+# ── Optional: LLM Answer Generation ─────────────────────────
+# Replace AnswerSynthesizer with an LLM-backed response.
+# Uncomment your preferred provider.
+
+anthropic>=0.20.0              # Claude (claude-sonnet-4-20250514 recommended)
+# openai>=1.10.0                 # OpenAI GPT models
+
+
+# ── Optional: PDF / Document Ingestion ───────────────────────
+# For loading PDFs and Word docs into the corpus.
+
+pypdf>=3.17.0                  # PDF text extraction
+python-docx>=1.1.0             # .docx text extraction
+
+
+# ── Optional: Persistent Storage ─────────────────────────────
+# For persisting the index between restarts.
+
+# chromadb>=0.4.0                # Embedded vector + metadata store
+# sqlalchemy>=2.0.0              # SQL-backed document/chunk metadata
+
+
+# ── Optional: Observability ──────────────────────────────────
+
+python-json-logger>=2.0.7      # Structured JSON logs
+prometheus-fastapi-instrumentator>=6.1.0  # Prometheus metrics endpoint
+
+# ── Optional: MCP server ───────────────────────────
+mcp[cli]>4.13.0                     # MCP server
