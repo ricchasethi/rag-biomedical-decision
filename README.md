@@ -23,10 +23,11 @@ Query → QueryAnalyzer → InvertedIndex (BM25) → Reranker → EvidenceClassi
 | `DocumentChunker` | Overlapping sliding-window chunker with section detection (Abstract/Methods/Results…) |
 | `InvertedIndex` | BM25 (Okapi) inverted index — outperforms TF-IDF for biomedical text |
 | `QueryAnalyzer` | Intent classification (mechanism/comparison/treatment/diagnosis/prognosis…) + entity extraction |
-| `Reranker` | Section-aware reranker: prioritizes Results/Methods for factual queries |
+| `Reranker` | Section-aware reranker with discriminative-token recall penalty to suppress off-topic false positives |
 | `EvidenceClassifier` | Labels each chunk as `direct`, `indirect`, or `contradictory` evidence |
 | `KnowledgeGapDetector` | Detects missing quantitative data, contradictions, low-relevance matches |
 | `AnswerSynthesizer` | Builds structured answer with explicit reasoning chain and confidence scoring |
+| `ClaudeSynthesizer` | Optional LLM-backed synthesizer — replaces rule-based answer with a Claude API call, strictly grounded in retrieved evidence |
 | `FollowUpGenerator` | Generates intent-aware follow-up questions |
 
 ---
@@ -46,6 +47,9 @@ python server.py  # http://localhost:8000
 
 # For the MCP server (Claude Code / Claude Desktop integration):
 pip install "mcp[cli]"
+
+# For LLM answer synthesis (ClaudeSynthesizer):
+pip install anthropic
 ```
 
 ---
@@ -75,6 +79,15 @@ python cli.py --ingest "alzheimer's disease biomarkers" --ingest-max 50
 
 # Ingest and persist to data/sample_corpus.py (survives process restart)
 python cli.py --ingest "alzheimer's disease biomarkers" --ingest-max 25 --save-corpus
+
+# Use Claude as the answer synthesizer (requires: pip install anthropic)
+python cli.py --llm --query "What biomarkers predict Alzheimer's disease?"
+
+# Use Claude and print the full prompt sent for each answer
+python cli.py --llm --show-prompt --query "What biomarkers predict Alzheimer's disease?"
+
+# LLM mode in interactive REPL
+python cli.py --llm --show-prompt
 ```
 
 Inside the interactive REPL you can also ingest on the fly, with an optional paper count:
@@ -89,12 +102,18 @@ Query> ingest CRISPR cancer therapy 25
 ```python
 from core.rag_engine import BioRAGEngine
 
+# Default: rule-based synthesizer, zero external dependencies
 engine = BioRAGEngine(
     chunk_size=512,
     chunk_overlap=64,
     retrieval_top_k=15,
     rerank_top_k=5,
 )
+
+# Optional: Claude-backed synthesizer (requires: pip install anthropic)
+from llm_synthesizer import ClaudeSynthesizer
+engine = BioRAGEngine(synthesizer=ClaudeSynthesizer())
+
 
 # Add documents
 engine.add_document(
@@ -291,6 +310,22 @@ Overconfident AI answers in clinical contexts can cause harm. The gap detector e
 flags when: quantitative data is absent, contradictions exist, relevance is low, or query
 entities have no coverage — surfacing uncertainty rather than hiding it.
 
+### Why discriminative-token recall in the Reranker?
+BM25 only rewards term presence — it never penalises term absence. A lung cancer paper
+that heavily uses "biomarker" and "disease" can score near the top for an Alzheimer's
+query even though it never mentions "alzheimer". The `Reranker` maintains a
+`_GENERIC_BIO_TERMS` set of ~80 words that appear in virtually every biomedical paper
+(biomarker, disease, patient, predict, detect, assess…). Query tokens not in this set
+are treated as **discriminative**; a chunk matching none of them receives an 85% score
+penalty. This keeps false positives out of the top-5 evidence nodes without any changes
+to BM25 or the index.
+
+### Why inject the synthesizer rather than subclass BioRAGEngine?
+`BioRAGEngine.__init__` accepts an optional `synthesizer` argument. Passing
+`ClaudeSynthesizer()` swaps in LLM answer generation while leaving every other pipeline
+stage (retrieval, reranking, classification, confidence scoring) unchanged. The default
+`AnswerSynthesizer` remains pure stdlib — no API key required for the core engine.
+
 ---
 
 ## Extending
@@ -304,13 +339,27 @@ from sentence_transformers import SentenceTransformer
 import faiss
 ```
 
-### Adding LLM answer generation
+### Using LLM answer generation
+`ClaudeSynthesizer` in `llm_synthesizer.py` is a drop-in replacement for
+`AnswerSynthesizer`. It calls `claude-sonnet-4-6` at `temperature=0` with the retrieved
+evidence formatted as numbered excerpts, and a strict system prompt that forbids drawing
+on training knowledge. The last prompt sent is stored in `synthesizer.last_prompt` for
+inspection.
+
 ```python
-# Replace AnswerSynthesizer._build_answer() with an LLM call:
-# Pass retrieved chunks as context, use the existing reasoning chain as the prompt
-import anthropic
-client = anthropic.Anthropic()
+from llm_synthesizer import ClaudeSynthesizer, SYSTEM_PROMPT
+from core.rag_engine import BioRAGEngine
+
+engine = BioRAGEngine(synthesizer=ClaudeSynthesizer())
+result = engine.query("What plasma biomarkers predict Alzheimer's disease?")
+
+# Inspect what was sent to Claude
+print(engine.synthesizer.last_prompt["system"])
+print(engine.synthesizer.last_prompt["user"])
 ```
+
+To extend or replace the synthesizer, subclass `AnswerSynthesizer` and override
+`synthesize()`. The reasoning chain steps and confidence scoring are inherited.
 
 ---
 
@@ -328,7 +377,8 @@ biorag/
 ├── tests/
 │   └── test_biorag.py      # 26 unit + integration tests
 ├── server.py               # FastAPI REST server (includes /ingest endpoint)
-├── cli.py                  # Interactive terminal interface (includes --save-corpus flag)
+├── cli.py                  # Interactive terminal interface (--llm, --show-prompt, --save-corpus)
+├── llm_synthesizer.py      # ClaudeSynthesizer — LLM-backed answer synthesis, strictly grounded
 ├── ingestion_pubmed.py     # PubMed/PMC ingestion pipeline with save_to_corpus()
 ├── mcp_server.py           # MCP server — exposes query/ingest/corpus_stats tools
 ├── requirements.txt

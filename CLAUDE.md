@@ -28,6 +28,12 @@ python cli.py
 # Single query
 python cli.py --query "What biomarkers predict CVD risk in T2DM?"
 
+# Use Claude as answer synthesizer (requires: pip install anthropic)
+python cli.py --llm --query "What biomarkers predict CVD risk in T2DM?"
+
+# Use Claude and print the full prompt sent to the LLM before each answer
+python cli.py --llm --show-prompt --query "What biomarkers predict CVD risk in T2DM?"
+
 # Demo all preset queries
 python cli.py --demo
 
@@ -67,7 +73,7 @@ BioRAGEngine.query(question)
   │
   ├─ QueryAnalyzer.analyze()          → intent, entities, expanded tokens
   ├─ InvertedIndex.search()           → BM25 retrieval, top-K chunks
-  ├─ Reranker.rerank()                → section-aware score adjustment
+  ├─ Reranker.rerank()                → section-aware score adjustment + discriminative-token recall penalty
   ├─ EvidenceClassifier.classify()    → direct / indirect / contradictory
   ├─ KnowledgeGapDetector.detect()    → missing data, contradictions, low relevance
   ├─ AnswerSynthesizer.synthesize()   → answer text + reasoning chain + confidence
@@ -289,6 +295,24 @@ splitting key sentences across boundaries.
 survive reranking. Increasing `retrieval_top_k` improves recall at the cost of more
 reranking work.
 
+### Reranker discriminative-token penalty
+
+`Reranker._GENERIC_BIO_TERMS` is a frozenset of ~80 words that appear in virtually
+every biomedical paper (biomarker, disease, patient, predict, detect, assess, elevated…).
+These carry no signal about *which* disease or entity a paper covers.
+
+At rerank time, **discriminative tokens** = `query_tokens − _GENERIC_BIO_TERMS`. A chunk
+that matches none of them gets `entity_factor = 0.15` (85% penalty). A chunk that
+matches some gets `entity_factor = 0.6 + 0.4 × (matched / total)`.
+
+**Why this matters**: BM25 only rewards term presence, not absence. A lung cancer paper
+that uses "biomarker" heavily can score near the top for an Alzheimer's query. The
+penalty suppresses these false positives without touching BM25 or the index.
+
+**Tuning**: if a legitimate paper is being under-scored, check whether its key tokens
+accidentally appear in `_GENERIC_BIO_TERMS`. Conversely, if off-topic papers still
+surface, add their shared generic tokens to the set.
+
 ### Adding a new query intent type
 1. Add the intent name and trigger phrases to `QueryAnalyzer.QUERY_TYPES`.
 2. Add section weights for that intent to `Reranker.SECTION_WEIGHTS`.
@@ -299,10 +323,32 @@ Replace or augment `InvertedIndex.search()`. The reranker, classifier, synthesiz
 and gap detector are all retrieval-agnostic — they only care about the `RetrievedChunk`
 interface.
 
-### Upgrading to LLM answer generation
-Replace `AnswerSynthesizer._build_answer()`. The reasoning chain construction and
-confidence scoring are independent of how the answer text is generated. Pass the
-retrieved chunks as context to the LLM and return its response as a list of strings.
+### Using LLM answer generation
+`llm_synthesizer.py` provides `ClaudeSynthesizer`, a ready-to-use subclass of
+`AnswerSynthesizer` that calls `claude-sonnet-4-6` at `temperature=0`.
+
+```python
+from llm_synthesizer import ClaudeSynthesizer
+from core.rag_engine import BioRAGEngine
+
+engine = BioRAGEngine(synthesizer=ClaudeSynthesizer())
+result = engine.query("What plasma biomarkers predict Alzheimer's?")
+
+# Inspect the exact prompt sent to Claude
+print(engine.synthesizer.last_prompt["system"])
+print(engine.synthesizer.last_prompt["user"])
+```
+
+Key properties:
+- `SYSTEM_PROMPT` is a module-level constant in `llm_synthesizer.py` — easy to audit and version.
+- The user message formats each `EvidenceNode` as a numbered excerpt with title, section, relevance, and support type (DIRECT / INDIRECT / CONTRADICTORY).
+- The system prompt forbids Claude from drawing on training knowledge; if the excerpts are insufficient it must say so.
+- Prompt caching (`"cache_control": {"type": "ephemeral"}`) is enabled on the system prompt.
+- Falls back to the parent's rule-based `_build_answer()` if the API call fails.
+
+To write a custom synthesizer, subclass `AnswerSynthesizer`, override `synthesize()`,
+and pass an instance to `BioRAGEngine(synthesizer=...)`. The reasoning chain steps and
+confidence scoring are inherited from the parent class.
 
 ---
 
@@ -328,7 +374,7 @@ known relevant documents.
 - Do not raise exceptions inside pipeline stages for low-quality results — return
   a `DecisionOutput` with low confidence instead. Exceptions are for programmer errors only.
 - Do not hardcode document IDs or titles anywhere in the engine logic.
-- Do not add LLM calls to the core engine without making them clearly optional (e.g.,
-  inject a callable or keep behind a flag).
+- Do not add LLM calls to the core engine (`core/rag_engine.py`). LLM integration lives
+  in `llm_synthesizer.py` and is injected via `BioRAGEngine(synthesizer=ClaudeSynthesizer())`.
 - Do not return raw BM25 scores to the user — they are not interpretable. Always
   normalize to a 0–1 relevance score before surfacing in `EvidenceNode`.
