@@ -64,8 +64,22 @@ CONFIDENCE_BARS = {
 }
 
 
-def render_output(output: DecisionOutput):
+def render_prompt(prompt: dict):
+    """Print the last LLM prompt (system + user) for inspection."""
+    print(header("LLM Prompt (sent to Claude)"))
+    print(section("System prompt"))
+    for line in prompt["system"].splitlines():
+        print(f"  {dim(line)}")
+    print(section("User message"))
+    for line in prompt["user"].splitlines():
+        print(f"  {dim(line)}")
+    print(f"\n{DIM}{'─'*60}{RESET}\n")
+
+
+def render_output(output: DecisionOutput, show_prompt: bool = False, synthesizer=None):
     """Render a DecisionOutput to terminal."""
+    if show_prompt and synthesizer is not None and getattr(synthesizer, "last_prompt", None):
+        render_prompt(synthesizer.last_prompt)
 
     # ── Header
     print(header("BioRAG Decision-Support Output"))
@@ -129,9 +143,14 @@ def render_output(output: DecisionOutput):
 
 # ─── Engine Setup ─────────────────────────────────────────────────────────────
 
-def build_engine() -> BioRAGEngine:
+def build_engine(use_llm: bool = False) -> BioRAGEngine:
     print(f"{DIM}Initializing BioRAG engine...{RESET}", end=" ", flush=True)
-    engine = BioRAGEngine()
+    synthesizer = None
+    if use_llm:
+        from llm_synthesizer import ClaudeSynthesizer
+        synthesizer = ClaudeSynthesizer()
+        print(f"{DIM}(LLM synthesizer: {ClaudeSynthesizer.MODEL}){RESET}", end=" ", flush=True)
+    engine = BioRAGEngine(synthesizer=synthesizer)
     total_chunks = 0
     for doc in SAMPLE_DOCUMENTS:
         n = engine.add_document(doc["id"], doc["title"], doc["text"], doc.get("metadata"))
@@ -154,7 +173,7 @@ DEMO_QUERIES = [
 ]
 
 
-def interactive_loop(engine: BioRAGEngine):
+def interactive_loop(engine: BioRAGEngine, show_prompt: bool = False):
     """Run interactive REPL."""
     print(header("BioRAG Decision-Support System — Interactive Mode"))
     print(f"  {dim('Type a clinical/scientific question, or:')}")
@@ -189,7 +208,7 @@ def interactive_loop(engine: BioRAGEngine):
                 pubmed_query, max_results = " ".join(parts), 10
             print(f"{DIM}Fetching {max_results} papers from PubMed/PMC: {pubmed_query}{RESET}")
             try:
-                ingest_pubmed(pubmed_query, max_results=max_results, engine=engine)
+                ing = ingest_pubmed(pubmed_query, max_results=max_results, engine=engine)
                 stats = engine.get_corpus_stats()
                 print(
                     f"{GREEN}Corpus updated:{RESET} "
@@ -198,6 +217,10 @@ def interactive_loop(engine: BioRAGEngine):
                     f"{stats['abstract_only_documents']} abstract-only · "
                     f"{stats['chunks']} chunks"
                 )
+                if ing.errors:
+                    print(f"{RED}Skipped {len(ing.errors)} item(s):{RESET}")
+                    for err in ing.errors:
+                        print(f"  [{err.stage}/{err.identifier}] {err.reason}")
             except Exception as exc:
                 print(f"{RED}Ingestion failed:{RESET} {exc}")
             continue
@@ -213,14 +236,14 @@ def interactive_loop(engine: BioRAGEngine):
                 t0 = time.perf_counter()
                 out = engine.query(dq)
                 elapsed = (time.perf_counter() - t0) * 1000
-                render_output(out)
+                render_output(out, show_prompt=show_prompt, synthesizer=engine.synthesizer)
                 print(f"{dim(f'Latency: {elapsed:.0f}ms')}")
             continue
 
         t0 = time.perf_counter()
         out = engine.query(query)
         elapsed = (time.perf_counter() - t0) * 1000
-        render_output(out)
+        render_output(out, show_prompt=show_prompt, synthesizer=engine.synthesizer)
         print(f"{dim(f'Latency: {elapsed:.0f}ms')}")
 
 
@@ -242,14 +265,31 @@ def main():
         "--ingest-max", metavar="N", type=int, default=10,
         help="Number of papers to fetch when using --ingest (default: 10)",
     )
+    parser.add_argument(
+        "--save-corpus", action="store_true",
+        help="Persist ingested papers to data/sample_corpus.py (use with --ingest)",
+    )
+    parser.add_argument(
+        "--llm", action="store_true",
+        help="Use Claude as the answer synthesizer (requires: pip install anthropic)",
+    )
+    parser.add_argument(
+        "--show-prompt", action="store_true",
+        help="Print the LLM prompt before each answer (only meaningful with --llm)",
+    )
     args = parser.parse_args()
 
-    engine = build_engine()
+    engine = build_engine(use_llm=args.llm)
 
     if args.ingest:
         print(f"{DIM}Fetching {args.ingest_max} papers from PubMed/PMC: {args.ingest}{RESET}")
         try:
-            ingest_pubmed(args.ingest, max_results=args.ingest_max, engine=engine)
+            ing = ingest_pubmed(
+                args.ingest,
+                max_results=args.ingest_max,
+                engine=engine,
+                save_corpus=args.save_corpus,
+            )
             stats = engine.get_corpus_stats()
             print(
                 f"{GREEN}Corpus updated:{RESET} "
@@ -258,6 +298,12 @@ def main():
                 f"{stats['abstract_only_documents']} abstract-only · "
                 f"{stats['chunks']} chunks\n"
             )
+            if args.save_corpus:
+                print(f"{GREEN}Papers saved to data/sample_corpus.py{RESET}\n")
+            if ing.errors:
+                print(f"{RED}Skipped {len(ing.errors)} item(s):{RESET}")
+                for err in ing.errors:
+                    print(f"  [{err.stage}/{err.identifier}] {err.reason}")
         except Exception as exc:
             print(f"{RED}Ingestion failed:{RESET} {exc}")
 
@@ -271,7 +317,7 @@ def main():
             t0 = time.perf_counter()
             out = engine.query(dq)
             elapsed = (time.perf_counter() - t0) * 1000
-            render_output(out)
+            render_output(out, show_prompt=args.show_prompt, synthesizer=engine.synthesizer)
             print(f"{dim(f'Latency: {elapsed:.0f}ms')}")
         return
 
@@ -279,11 +325,11 @@ def main():
         t0 = time.perf_counter()
         out = engine.query(args.query)
         elapsed = (time.perf_counter() - t0) * 1000
-        render_output(out)
+        render_output(out, show_prompt=args.show_prompt, synthesizer=engine.synthesizer)
         print(f"{dim(f'Latency: {elapsed:.0f}ms')}")
         return
 
-    interactive_loop(engine)
+    interactive_loop(engine, show_prompt=args.show_prompt)
 
 
 if __name__ == "__main__":

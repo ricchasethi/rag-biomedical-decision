@@ -1,7 +1,27 @@
 import requests
 import time
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
+from pathlib import Path
 from core.rag_engine import BioRAGEngine
+
+_CORPUS_PATH = Path(__file__).parent / "data" / "sample_corpus.py"
+
+
+@dataclass
+class IngestionError:
+    """A single item that was skipped during ingestion, with its cause."""
+    stage: str       # "elink", "pmc_fetch", "pmc_parse", "pubmed_fetch", "pubmed_parse"
+    identifier: str  # PMID, PMCID, positional index, or "batch"
+    reason: str      # str(exception)
+
+
+@dataclass
+class IngestionResult:
+    """Structured return value from ingest_pubmed."""
+    engine: BioRAGEngine
+    indexed: int
+    errors: list[IngestionError] = field(default_factory=list)
 
 # ─────────────────────────────────────────────
 # CONFIG
@@ -48,11 +68,14 @@ def fetch_pubmed_details(pmids: list[str]) -> str:
     return r.text
 
 
-def get_pmc_ids_for_pmids(pmids: list[str]) -> dict[str, str]:
+def get_pmc_ids_for_pmids(
+    pmids: list[str],
+) -> tuple[dict[str, str], list[IngestionError]]:
     """Use elink to find PMC IDs linked to given PubMed IDs.
 
-    Returns a dict mapping PMID → PMCID for articles available in PMC.
-    PMIDs without a PMC full-text record are omitted from the result.
+    Returns a dict mapping PMID → PMCID for articles available in PMC, plus
+    a list of per-PMID errors for any elink requests that failed.
+    PMIDs without a PMC full-text record are omitted from the mapping.
 
     One request is made per PMID because batching collapses all results
     into a single linkset with no per-PMID attribution, making it
@@ -60,6 +83,7 @@ def get_pmc_ids_for_pmids(pmids: list[str]) -> dict[str, str]:
     """
     url = BASE_URL + "elink.fcgi"
     pmid_to_pmcid: dict[str, str] = {}
+    errors: list[IngestionError] = []
 
     for pmid in pmids:
         params = {
@@ -70,20 +94,23 @@ def get_pmc_ids_for_pmids(pmids: list[str]) -> dict[str, str]:
             "tool": TOOL,
             "email": EMAIL,
         }
-        r = requests.get(url, params=params)
-        r.raise_for_status()
-        data = r.json()
+        try:
+            r = requests.get(url, params=params)
+            r.raise_for_status()
+            data = r.json()
 
-        for linkset in data.get("linksets", []):
-            for linksetdb in linkset.get("linksetdbs", []):
-                if linksetdb.get("dbto") == "pmc":
-                    pmc_links = linksetdb.get("links", [])
-                    if pmc_links:
-                        pmid_to_pmcid[pmid] = pmc_links[0]
+            for linkset in data.get("linksets", []):
+                for linksetdb in linkset.get("linksetdbs", []):
+                    if linksetdb.get("dbto") == "pmc":
+                        pmc_links = linksetdb.get("links", [])
+                        if pmc_links:
+                            pmid_to_pmcid[pmid] = pmc_links[0]
+        except Exception as exc:
+            errors.append(IngestionError(stage="elink", identifier=pmid, reason=str(exc)))
 
         time.sleep(0.34)  # NCBI rate limit: ≤3 requests/second without API key
 
-    return pmid_to_pmcid
+    return pmid_to_pmcid, errors
 
 
 def fetch_pmc_fulltext(pmcids: list[str]) -> str:
@@ -110,22 +137,63 @@ def _iter_text(element: ET.Element) -> str:
     return "".join(element.itertext()).strip()
 
 
-def parse_pubmed_xml(xml_text: str) -> list[dict]:
+def _strip_citation_xrefs(root: ET.Element) -> None:
+    """Remove inline citation markers from a JATS XML tree in-place.
+
+    In JATS XML, every in-text citation appears as:
+        <xref ref-type="bibr" rid="bib1">1</xref>
+    When itertext() concatenates the surrounding text, the citation number
+    gets stitched directly onto the preceding word, producing artifacts like:
+        "DKD.1 Within"   "fibrosis.34,35 However"   "therapy,3 hypoglycemic"
+
+    This function removes those xref elements while correctly preserving the
+    tail text (the text that follows the closing </xref> tag in the source),
+    which belongs to the sentence and must not be lost.
+
+    Why tail text matters in ElementTree:
+        <p>DKD<xref>1</xref> Within China</p>
+        element.text  = "DKD"
+        xref.text     = "1"
+        xref.tail     = " Within China"   ← this lives on the xref, not the <p>
+    Removing the xref without splicing the tail would silently drop " Within China".
+    """
+    for parent in root.iter():
+        to_remove = [
+            (i, child)
+            for i, child in enumerate(parent)
+            if child.tag == "xref" and child.get("ref-type") == "bibr"
+        ]
+        # Iterate in reverse so indices stay valid as we remove elements
+        for i, child in reversed(to_remove):
+            tail = child.tail or ""
+            siblings = list(parent)
+            if i == 0:
+                # No preceding sibling: splice tail onto the parent's own text
+                parent.text = (parent.text or "") + tail
+            else:
+                # Splice tail onto the preceding sibling's tail
+                prev = siblings[i - 1]
+                prev.tail = (prev.tail or "") + tail
+            parent.remove(child)
+
+
+def parse_pubmed_xml(xml_text: str) -> tuple[list[dict], list[IngestionError]]:
     """Extract structured papers (abstract only) from PubMed efetch XML."""
     root = ET.fromstring(xml_text)
-    papers = []
+    papers: list[dict] = []
+    errors: list[IngestionError] = []
 
-    for article in root.findall(".//PubmedArticle"):
+    for i, article in enumerate(root.findall(".//PubmedArticle")):
+        identifier = f"article_{i}"
         try:
-            title = article.findtext(".//ArticleTitle", default="No title")
+            pmid = article.findtext(".//PMID") or identifier
+            identifier = pmid
 
+            title = article.findtext(".//ArticleTitle", default="No title")
             abstract_parts = article.findall(".//AbstractText")
             abstract = "\n".join([a.text or "" for a in abstract_parts])
-
             year = article.findtext(".//PubDate/Year", default="Unknown")
             journal = article.findtext(".//Journal/Title", default="Unknown")
-            pmid = article.findtext(".//PMID", default="unknown")
-
             text = f"Abstract\n{abstract}".strip()
 
             papers.append({
@@ -140,14 +208,13 @@ def parse_pubmed_xml(xml_text: str) -> list[dict]:
                     "has_full_text": False,
                 },
             })
+        except Exception as exc:
+            errors.append(IngestionError(stage="pubmed_parse", identifier=identifier, reason=str(exc)))
 
-        except Exception as e:
-            print(f"Skipping PubMed article due to error: {e}")
-
-    return papers
+    return papers, errors
 
 
-def parse_pmc_xml(xml_text: str) -> list[dict]:
+def parse_pmc_xml(xml_text: str) -> tuple[list[dict], list[IngestionError]]:
     """Extract structured full-text papers from PMC JATS XML.
 
     Parses the <body> element for section titles and paragraphs.
@@ -155,12 +222,20 @@ def parse_pmc_xml(xml_text: str) -> list[dict]:
     metadata-only records).
     """
     root = ET.fromstring(xml_text)
-    papers = []
+    papers: list[dict] = []
+    errors: list[IngestionError] = []
 
-    for article in root.findall(".//article"):
+    for i, article in enumerate(root.findall(".//article")):
+        identifier = f"article_{i}"
         try:
+            # Strip inline citation markers before any text extraction.
+            # Must happen first so _iter_text() never sees the raw citation numbers.
+            _strip_citation_xrefs(article)
+
             pmcid = article.findtext(".//article-id[@pub-id-type='pmc']") or ""
             pmid  = article.findtext(".//article-id[@pub-id-type='pmid']") or ""
+            identifier = f"pmc_{pmcid}" if pmcid else f"pmid_{pmid}" if pmid else identifier
+
             title = article.findtext(".//article-title", default="No title")
 
             # Year — try multiple pub-date variants
@@ -227,11 +302,88 @@ def parse_pmc_xml(xml_text: str) -> list[dict]:
                     "has_full_text": bool(sections),
                 },
             })
+        except Exception as exc:
+            errors.append(IngestionError(stage="pmc_parse", identifier=identifier, reason=str(exc)))
 
-        except Exception as e:
-            print(f"Skipping PMC article due to error: {e}")
+    return papers, errors
 
-    return papers
+
+# ─────────────────────────────────────────────
+# CORPUS PERSISTENCE
+# ─────────────────────────────────────────────
+
+def save_to_corpus(
+    papers: list[dict],
+    corpus_path: Path | None = None,
+) -> int:
+    """Append new papers to data/sample_corpus.py.
+
+    Each paper dict must have the same shape that ingest_pubmed produces:
+    {"id", "title", "text", "metadata"}.
+
+    Papers whose doc_id already exists in SAMPLE_DOCUMENTS are skipped so
+    re-running ingestion on the same query is always safe.
+
+    Returns the number of entries actually written.
+
+    How it works
+    ────────────
+    The corpus file ends with  },\n\n]  (the closing bracket of
+    SAMPLE_DOCUMENTS).  We strip that trailing bracket, append each new
+    entry formatted as a Python dict literal, then close the list again.
+    Using repr() for all string values safely escapes quotes, backslashes,
+    and any Unicode characters that appear in biomedical titles and text.
+    """
+    if corpus_path is None:
+        corpus_path = _CORPUS_PATH
+
+    # Discover existing IDs without importing the whole module again (avoids
+    # stale-cache issues when this function is called from the same process
+    # that already imported sample_corpus earlier).
+    from data.sample_corpus import SAMPLE_DOCUMENTS
+    existing_ids: set[str] = {d["id"] for d in SAMPLE_DOCUMENTS}
+
+    new_papers = [p for p in papers if p["id"] not in existing_ids]
+    if not new_papers:
+        return 0
+
+    raw = corpus_path.read_text(encoding="utf-8")
+
+    # Strip the closing bracket (last ']') and any trailing whitespace so we
+    # can insert entries before it.
+    close_pos = raw.rfind("]")
+    if close_pos == -1:
+        raise ValueError(f"Could not find closing ']' in {corpus_path}")
+    preamble = raw[:close_pos].rstrip()
+
+    entries: list[str] = []
+    for paper in new_papers:
+        meta = paper.get("metadata") or {}
+        # Build metadata lines individually so booleans stay as Python literals
+        # (True/False) rather than repr strings.
+        meta_lines = [
+            f'            "year": {repr(meta.get("year", "Unknown"))},',
+            f'            "journal": {repr(meta.get("journal", "Unknown"))},',
+            f'            "source": {repr(meta.get("source", "pubmed"))},',
+            f'            "pmcid": {repr(meta.get("pmcid", ""))},',
+            f'            "pmid": {repr(meta.get("pmid", ""))},',
+            f'            "has_full_text": {meta.get("has_full_text", False)},',
+        ]
+        entry = (
+            "    {\n"
+            f'        "id": {repr(paper["id"])},\n'
+            f'        "title": {repr(paper["title"])},\n'
+            f'        "text": {repr(paper["text"])},\n'
+            "        \"metadata\": {\n"
+            + "\n".join(meta_lines) + "\n"
+            "        },\n"
+            "    },"
+        )
+        entries.append(entry)
+
+    new_content = preamble + "\n\n" + "\n\n".join(entries) + "\n\n]\n"
+    corpus_path.write_text(new_content, encoding="utf-8")
+    return len(new_papers)
 
 
 # ─────────────────────────────────────────────
@@ -242,7 +394,8 @@ def ingest_pubmed(
     query: str,
     max_results: int = 10,
     engine: BioRAGEngine | None = None,
-) -> BioRAGEngine:
+    save_corpus: bool = False,
+) -> IngestionResult:
     """Ingest papers for *query* into a BioRAGEngine.
 
     For each paper found on PubMed, the pipeline first attempts to retrieve
@@ -252,9 +405,19 @@ def ingest_pubmed(
     If *engine* is supplied, documents are added to it directly (useful for
     the REST server or CLI where an existing corpus should be augmented).
     Otherwise a fresh BioRAGEngine is created and returned.
+
+    When *save_corpus* is True, all successfully indexed papers are appended
+    to data/sample_corpus.py so they persist across process restarts.
+    Papers already present in the corpus are silently skipped.
+
+    Returns an IngestionResult with the engine, the count of successfully
+    indexed papers, and a list of IngestionErrors for any items that were
+    skipped (parse failures, per-PMID network errors, batch fetch errors).
     """
     if engine is None:
         engine = BioRAGEngine()
+
+    all_errors: list[IngestionError] = []
 
     print(f"Searching PubMed for: {query}")
     pmids = search_pubmed(query, max_results)
@@ -262,11 +425,12 @@ def ingest_pubmed(
 
     if not pmids:
         print("No results found.")
-        return engine
+        return IngestionResult(engine=engine, indexed=0)
 
     # ── Step 1: resolve which PMIDs have PMC full text ───────────────────────
     print("Resolving PMC full-text availability via elink...")
-    pmid_to_pmcid = get_pmc_ids_for_pmids(pmids)  # sleep is inside, one req/PMID
+    pmid_to_pmcid, link_errors = get_pmc_ids_for_pmids(pmids)
+    all_errors.extend(link_errors)
     pmcids = list(pmid_to_pmcid.values())
     pmids_without_pmc = [p for p in pmids if p not in pmid_to_pmcid]
 
@@ -277,8 +441,12 @@ def ingest_pubmed(
     pmc_papers: list[dict] = []
     if pmcids:
         time.sleep(0.34)
-        pmc_xml = fetch_pmc_fulltext(pmcids)
-        pmc_papers = parse_pmc_xml(pmc_xml)
+        try:
+            pmc_xml = fetch_pmc_fulltext(pmcids)
+            pmc_papers, parse_errors = parse_pmc_xml(pmc_xml)
+            all_errors.extend(parse_errors)
+        except Exception as exc:
+            all_errors.append(IngestionError(stage="pmc_fetch", identifier="batch", reason=str(exc)))
 
     for paper in pmc_papers:
         n = engine.add_document(
@@ -295,8 +463,12 @@ def ingest_pubmed(
     abstract_papers: list[dict] = []
     if pmids_without_pmc:
         time.sleep(0.34)
-        pubmed_xml = fetch_pubmed_details(pmids_without_pmc)
-        abstract_papers = parse_pubmed_xml(pubmed_xml)
+        try:
+            pubmed_xml = fetch_pubmed_details(pmids_without_pmc)
+            abstract_papers, parse_errors = parse_pubmed_xml(pubmed_xml)
+            all_errors.extend(parse_errors)
+        except Exception as exc:
+            all_errors.append(IngestionError(stage="pubmed_fetch", identifier="batch", reason=str(exc)))
 
     for paper in abstract_papers:
         n = engine.add_document(
@@ -309,10 +481,15 @@ def ingest_pubmed(
         time.sleep(0.1)
 
     total = len(pmc_papers) + len(abstract_papers)
-    print(f"\nIngestion complete — {total} papers indexed")
+    print(f"\nIngestion complete — {total} papers indexed, {len(all_errors)} skipped")
     print(engine.get_corpus_stats())
 
-    return engine
+    if save_corpus:
+        all_papers = pmc_papers + abstract_papers
+        saved = save_to_corpus(all_papers)
+        print(f"Saved {saved} new paper(s) to data/sample_corpus.py")
+
+    return IngestionResult(engine=engine, indexed=total, errors=all_errors)
 
 
 # ─────────────────────────────────────────────
@@ -320,11 +497,27 @@ def ingest_pubmed(
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-    engine = ingest_pubmed(
-        query="alzheimer's disease biomarkers",
-        max_results=5,
-    )
+    import argparse
 
-    result = engine.query("What biomarkers predict alzheimer's disease?")
+    parser = argparse.ArgumentParser(description="Ingest PubMed papers into BioRAG")
+    parser.add_argument("--query", default="alzheimer's disease biomarkers",
+                        help="PubMed search query")
+    parser.add_argument("--max-results", type=int, default=5,
+                        help="Maximum number of papers to fetch (default: 5)")
+    parser.add_argument("--save-corpus", action="store_true",
+                        help="Append ingested papers to data/sample_corpus.py")
+    args = parser.parse_args()
+
+    ingest_result = ingest_pubmed(
+        query=args.query,
+        max_results=args.max_results,
+        save_corpus=args.save_corpus,
+    )
+    if ingest_result.errors:
+        print(f"\nSkipped {len(ingest_result.errors)} item(s):")
+        for err in ingest_result.errors:
+            print(f"  [{err.stage}/{err.identifier}] {err.reason}")
+
+    result = ingest_result.engine.query("What biomarkers predict alzheimer's disease?")
     print("\n--- ANSWER ---\n")
     print(result.answer)

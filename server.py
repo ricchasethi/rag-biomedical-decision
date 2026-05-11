@@ -19,7 +19,7 @@ from pydantic import BaseModel
 
 from core.rag_engine import BioRAGEngine, DecisionOutput
 from data.sample_corpus import SAMPLE_DOCUMENTS
-from ingestion_pubmed import ingest_pubmed
+from ingestion_pubmed import ingest_pubmed, IngestionError
 
 # ─── App Setup ────────────────────────────────────────────────────────────────
 
@@ -185,7 +185,7 @@ def ingest_endpoint(req: IngestRequest):
 
     docs_before = len(engine.documents)
     try:
-        ingest_pubmed(req.query, max_results=req.max_results, engine=engine)
+        ingest_result = ingest_pubmed(req.query, max_results=req.max_results, engine=engine)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"PubMed/PMC fetch failed: {exc}") from exc
 
@@ -195,6 +195,10 @@ def ingest_endpoint(req: IngestRequest):
         "query": req.query,
         "documents_added": len(engine.documents) - docs_before,
         "corpus_stats": stats,
+        "errors": [
+            {"stage": e.stage, "identifier": e.identifier, "reason": e.reason}
+            for e in ingest_result.errors
+        ],
     }
 
 

@@ -72,6 +72,9 @@ python cli.py --ingest "alzheimer's disease biomarkers"
 
 # Fetch more papers
 python cli.py --ingest "alzheimer's disease biomarkers" --ingest-max 50
+
+# Ingest and persist to data/sample_corpus.py (survives process restart)
+python cli.py --ingest "alzheimer's disease biomarkers" --ingest-max 25 --save-corpus
 ```
 
 Inside the interactive REPL you can also ingest on the fly, with an optional paper count:
@@ -222,6 +225,54 @@ python tests/test_biorag.py
 
 ---
 
+## Retrieval Evals
+
+The `evals/` directory contains a retrieval quality harness that measures **MRR** (Mean
+Reciprocal Rank) and **NDCG@K** independently for the BM25 and reranker stages.
+
+```bash
+# Full eval set (16 queries across all disease areas)
+python evals/retrieval_eval.py
+
+# Alzheimer's disease subset only (7 queries, Q01–Q07)
+python evals/retrieval_eval.py --alzheimer-only
+
+# Show per-query detail: top-3 retrieved docs vs ground truth
+python evals/retrieval_eval.py --verbose
+
+# Custom K values
+python evals/retrieval_eval.py --ks 1 5 10
+```
+
+Sample output:
+
+```
+  Metric           BM25   Reranked        Δ
+  ─────────────────────────────────────────
+  MRR@5           1.000      1.000   +0.000
+  NDCG@1          0.958      0.958   +0.000
+  NDCG@3          0.978      0.970   -0.008
+  NDCG@5          0.985      0.970   -0.015
+```
+
+**Metrics explained:**
+
+- **MRR@K** — Mean Reciprocal Rank: measures where the first relevant document lands.
+  High MRR means the system surfaces the right answer quickly.
+- **NDCG@K** — Normalized Discounted Cumulative Gain: rewards the full ranked list using
+  graded relevance (2 = directly answers, 1 = partially relevant, 0 = irrelevant).
+  Penalises a system that buries a highly-relevant document at rank 3 vs rank 1.
+
+The Δ column shows `Reranked − BM25`. A negative NDCG@3 delta indicates the reranker's
+`rerank_top_k` budget is trimming documents that are partially relevant to multi-document
+queries — a useful signal when tuning the reranker.
+
+**Ground truth** is in `evals/ground_truth.py` as `EVAL_QUERIES` — a list of
+`RetrievalQuery` objects with hand-labelled `{doc_id: grade}` relevance dicts. Add new
+queries there after ingesting new papers to keep the eval set growing with the corpus.
+
+---
+
 ## Key Design Decisions
 
 ### Why BM25, not dense embeddings?
@@ -270,12 +321,15 @@ biorag/
 ├── core/
 │   └── rag_engine.py       # All core components (single file, zero deps)
 ├── data/
-│   └── sample_corpus.py    # Biomedical corpus sourced from PubMed Central
+│   └── sample_corpus.py    # Biomedical corpus sourced from PubMed Central (citation-cleaned)
+├── evals/
+│   ├── ground_truth.py     # 16 annotated queries with doc-level relevance grades (0/1/2)
+│   └── retrieval_eval.py   # MRR and NDCG@K harness — evaluates BM25 vs reranker separately
 ├── tests/
 │   └── test_biorag.py      # 26 unit + integration tests
 ├── server.py               # FastAPI REST server (includes /ingest endpoint)
-├── cli.py                  # Interactive terminal interface (includes ingest command)
-├── ingestion_pubmed.py     # PubMed/PMC full-text ingestion pipeline
+├── cli.py                  # Interactive terminal interface (includes --save-corpus flag)
+├── ingestion_pubmed.py     # PubMed/PMC ingestion pipeline with save_to_corpus()
 ├── mcp_server.py           # MCP server — exposes query/ingest/corpus_stats tools
 ├── requirements.txt
 └── README.md

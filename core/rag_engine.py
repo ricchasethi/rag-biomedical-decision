@@ -10,6 +10,7 @@ import math
 import json
 import hashlib
 import textwrap
+import threading
 from pathlib import Path
 from typing import Optional
 from dataclasses import dataclass, field, asdict
@@ -134,11 +135,66 @@ class TextProcessor:
 
     @classmethod
     def clean_text(cls, text: str) -> str:
-        """Normalize whitespace and fix common OCR artifacts."""
+        """Normalize whitespace and remove citation artifacts from biomedical text.
+
+        Five citation forms are stripped, covering the two encoding styles
+        found in PMC full-text and PubMed abstract sources:
+
+        No-space style (JATS <xref> artifacts after XML concatenation):
+          .1 / .7,8    "DKD.1 Within"           → "DKD. Within"
+          ,3 / ,12,13  "anti-inflammatory,3 hypo" → "anti-inflammatory hypo"
+
+        Spaced style (citations typeset with surrounding spaces):
+          . N / ) N    "worldwide. 1 Its"        → "worldwide. Its"
+                       "(PRS) 9 and"             → "(PRS) and"
+          . N , M      "tau. 2 , 3 Despite"      → "tau. Despite"
+          N , M , P…   " 31 , 32 , 33 In AD"     → " In AD"  (3+ numbers)
+          , N          "SBayesRC, 37 and"         → "SBayesRC and"
+
+        Intentionally NOT stripped — too ambiguous without NLP context:
+          word N word  "eQTLGen 38 yielded" or "50 million individuals"
+                       (single inline number after a word, no punctuation cue)
+        """
         text = re.sub(r'\s+', ' ', text)
-        text = re.sub(r'(\w)-\s+(\w)', r'\1\2', text)  # fix line-break hyphenation
-        text = re.sub(r'\[\d+\]', '', text)              # remove citation brackets
-        return text.strip()
+        text = re.sub(r'(\w)-\s+(\w)', r'\1\2', text)   # fix line-break hyphenation
+        text = re.sub(r'\[\d+\]', '', text)               # [1] bracket citations
+
+        # ── No-space style ────────────────────────────────────────────────────
+        # Period-superscript: letter/% + .N (preceding digit excluded to protect
+        # decimals like 0.05 and CI values like −0.66).
+        text = re.sub(
+            r'(?<=[A-Za-z%])\.\d{1,3}(?:,\d{1,3})*(?=\s+[A-Za-z])',
+            '.',
+            text,
+        )
+        # Comma-superscript (no space): word,N word
+        text = re.sub(
+            r'(?<=[A-Za-z])(,\d{1,3})+(?=\s+[a-z])',
+            '',
+            text,
+        )
+
+        # ── Spaced style ──────────────────────────────────────────────────────
+        # After sentence-ending . or closing ): ". 1 Word"  ") 9 and"
+        text = re.sub(
+            r'(?<=[.)]) \d{1,3}(?: , \d{1,3})* (?=[A-Za-z])',
+            ' ',
+            text,
+        )
+        # Standalone series of 3+ spaced numbers: " 31 , 32 , 33 Word"
+        text = re.sub(
+            r' \d{1,3}(?: , \d{1,3}){2,} (?=[A-Za-z])',
+            ' ',
+            text,
+        )
+        # Comma-space citation: "word, 37 and"
+        text = re.sub(
+            r'(?<=[A-Za-z]), \d{1,3}(?: , \d{1,3})* (?=[a-z])',
+            ' ',
+            text,
+        )
+
+        return re.sub(r'\s+', ' ', text).strip()  # re-normalise after removals
 
     @classmethod
     def extract_sentences(cls, text: str) -> list[str]:
@@ -148,6 +204,22 @@ class TextProcessor:
         protected = re.sub(f'({abbrevs})\\.', r'\1<DOT>', text)
         sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', protected)
         return [s.replace('<DOT>', '.').strip() for s in sentences if s.strip()]
+
+    @classmethod
+    def truncate_at_sentence(cls, text: str, max_chars: int) -> str:
+        """Return text truncated at a sentence boundary not exceeding max_chars.
+
+        Falls back to the raw slice only when no sentence fits within the limit.
+        """
+        if len(text) <= max_chars:
+            return text
+        result = ""
+        for sentence in cls.extract_sentences(text):
+            candidate = f"{result} {sentence}".strip() if result else sentence
+            if len(candidate) > max_chars:
+                break
+            result = candidate
+        return result if result else text[:max_chars]
 
 
 # ─── Document Chunker ─────────────────────────────────────────────────────────
@@ -324,12 +396,15 @@ class InvertedIndex:
 
         for term in set(query_tokens):
             if term not in self.index:
-                # Try prefix matching for biomedical terms
-                matches = [t for t in self.index if t.startswith(term[:4]) and len(t) >= 4]
-                for matched_term in matches[:3]:
-                    for chunk_id, tf in self.index[matched_term]:
-                        scores[chunk_id] += self._bm25_score(matched_term, chunk_id, tf) * 0.7
-                        chunk_match_terms[chunk_id].append(f"~{matched_term}")
+                # Prefix matching only when the query token is long enough that
+                # a 4-char prefix is discriminative. Short tokens (≤6 chars) like
+                # "hemo", "age", "il" would match too many unrelated indexed terms.
+                if len(term) > 6:
+                    matches = [t for t in self.index if t.startswith(term[:4]) and len(t) >= 4]
+                    for matched_term in matches[:3]:
+                        for chunk_id, tf in self.index[matched_term]:
+                            scores[chunk_id] += self._bm25_score(matched_term, chunk_id, tf) * 0.7
+                            chunk_match_terms[chunk_id].append(f"~{matched_term}")
             else:
                 for chunk_id, tf in self.index[term]:
                     scores[chunk_id] += self._bm25_score(term, chunk_id, tf)
@@ -433,7 +508,7 @@ class Reranker:
     Re-ranks initial BM25 results using additional signals:
     - Section relevance (Methods/Results prioritized for factual queries)
     - Term density (concentration of query terms)
-    - Sentence-level cross-encoding approximation
+    - Discriminative-token recall (penalises off-topic false positives)
     """
 
     SECTION_WEIGHTS = {
@@ -445,16 +520,63 @@ class Reranker:
         "general":    {"Abstract": 1.1, "Results": 1.1, "Discussion": 1.0},
     }
 
+    # Terms that appear in virtually every biomedical paper and therefore carry
+    # no discriminative signal about *which* disease or entity a paper covers.
+    # A chunk that matches only these terms but misses the specific entity token
+    # (e.g. "alzheimer", "egfr") gets a heavy penalty so it does not crowd out
+    # truly relevant results.
+    #
+    # Includes both domain nouns (biomarker, disease) AND common clinical/scientific
+    # verbs and adjectives that appear in any query about any disease area
+    # (predict, detect, identify, assess…).  Without these, a query like
+    # "What biomarkers predict Alzheimer's?" would treat "predict" as discriminative
+    # and falsely rescue off-topic papers that heavily use "predict".
+    _GENERIC_BIO_TERMS: frozenset[str] = frozenset({
+        # Domain nouns ubiquitous across all disease areas
+        "biomarker", "biomarkers", "marker", "markers", "disease", "diseases",
+        "patient", "patients", "study", "studies", "treatment", "treatments",
+        "expression", "level", "levels", "plasma", "blood", "serum",
+        "cell", "cells", "protein", "proteins", "gene", "genes",
+        "clinical", "risk", "therapy", "therapies", "analysis",
+        "result", "results", "finding", "findings", "association",
+        "tumor", "tumour", "sample", "data", "method", "methods",
+        "diagnosis", "prognosis", "detection", "prediction", "response",
+        "factor", "factors", "effect", "effects", "increase", "decrease",
+        "significant", "significantly", "compared", "group", "groups",
+        "control", "measure", "measurement", "outcome", "outcomes",
+        "cohort", "population", "baseline", "median", "mean", "ratio",
+        "age", "sex", "test", "tissue", "model", "concentration", "type",
+        # Common clinical/scientific verbs used in queries about any disease
+        "predict", "predicted", "predictive", "predictor", "predictors",
+        "detect", "detected", "detectable", "identify", "identified",
+        "assess", "assessed", "assessment", "evaluate", "evaluated",
+        "measure", "measured", "determine", "determined",
+        "associate", "associated", "correlate", "correlated", "correlation",
+        "indicate", "indicated", "demonstrate", "demonstrated",
+        "report", "reported", "investigate", "investigated",
+        "suggest", "suggested", "compare", "compared",
+        "improve", "improved", "reduce", "reduced", "inhibit", "inhibited",
+        "use", "used", "using", "show", "shown", "found",
+        # Common adjectives appearing in clinical queries across all diseases
+        "early", "late", "novel", "potential", "effective", "accurate",
+        "sensitive", "specific", "elevated", "increased", "decreased",
+        "high", "low", "new", "current", "recent", "common",
+    })
+
     def rerank(
         self,
         results: list[RetrievedChunk],
         query_analysis: dict,
         top_k: int = 5,
     ) -> list[RetrievedChunk]:
-        """Apply section weight and term density to rerank results."""
+        """Apply section weight, term density, and discriminative-token recall to rerank results."""
         intent = query_analysis["intent"]
         section_weights = self.SECTION_WEIGHTS.get(intent, self.SECTION_WEIGHTS["general"])
         query_tokens = set(query_analysis["expanded_tokens"])
+
+        # Tokens that are unique to this query's topic (not generic biomedical noise).
+        # Missing any of these from a chunk is a strong signal the chunk is off-topic.
+        discriminative = query_tokens - self._GENERIC_BIO_TERMS
 
         reranked = []
         for r in results:
@@ -470,7 +592,22 @@ class Reranker:
             # Position bonus for early chunks (abstract/intro often most informative)
             position_bonus = 1.0 + (0.05 / max(r.rank, 1))
 
-            adjusted_score = r.score * section_w * (1 + density * 0.4) * position_bonus
+            # Discriminative-token recall penalty.
+            # When the query has specific entity tokens (disease names, gene names, etc.)
+            # a chunk that matches none of them is almost certainly an off-topic false
+            # positive promoted by a generic term like "biomarker".
+            if discriminative:
+                matched = discriminative & chunk_token_set
+                if not matched:
+                    entity_factor = 0.15   # matches zero entity-specific tokens → demote hard
+                else:
+                    entity_factor = 0.6 + 0.4 * (len(matched) / len(discriminative))
+            else:
+                entity_factor = 1.0  # fully generic query — no penalty
+
+            adjusted_score = (
+                r.score * section_w * (1 + density * 0.4) * position_bonus * entity_factor
+            )
 
             reranked.append(RetrievedChunk(
                 chunk=r.chunk,
@@ -561,6 +698,7 @@ class KnowledgeGapDetector:
         query_analysis: dict,
         evidence: list[EvidenceNode],
         all_results: list[RetrievedChunk],
+        corpus_chunk_count: int = 0,
     ) -> list[str]:
         """Return list of identified knowledge gaps."""
         gaps = []
@@ -593,12 +731,20 @@ class KnowledgeGapDetector:
                 "answer may reflect incomplete consensus"
             )
 
-        # Low score gap
-        if all_results and all_results[0].score < 2.0:
-            gaps.append(
-                "Retrieved evidence has low relevance scores — "
-                "the documents may not directly address this query"
-            )
+        # Low score gap — threshold scales with corpus size.
+        # BM25 IDF for a rare term ≈ log((N + 0.5) / 1.5 + 1); a single
+        # well-matched term contributes roughly idf × (K1+1) ≈ idf × 2.5.
+        # We flag when the top score falls below 1.5 × idf_rare, meaning
+        # not even one term matched strongly — this scales correctly as N grows.
+        if all_results:
+            n = max(corpus_chunk_count, 1)
+            idf_rare = math.log((n + 0.5) / 1.5 + 1)
+            low_score_threshold = idf_rare * 1.5
+            if all_results[0].score < low_score_threshold:
+                gaps.append(
+                    "Retrieved evidence has low relevance scores — "
+                    "the documents may not directly address this query"
+                )
 
         # Recency gap (heuristic)
         old_docs = [e for e in evidence if re.search(r'\b(19|200[0-5])\d{2}\b', e.excerpt)]
@@ -720,8 +866,8 @@ class AnswerSynthesizer:
                 f"the following can be stated regarding your query:"
             )
             for i, e in enumerate(direct_evidence[:3], 1):
-                excerpt_summary = e.excerpt[:300].strip()
-                if len(e.excerpt) > 300:
+                excerpt_summary = TextProcessor.truncate_at_sentence(e.excerpt, 300)
+                if len(excerpt_summary) < len(e.excerpt):
                     excerpt_summary += "..."
                 parts.append(f"[{i}] From '{e.doc_title}' ({e.section}): {excerpt_summary}")
         elif indirect_evidence:
@@ -729,8 +875,8 @@ class AnswerSynthesizer:
                 "No direct statements were found, but the following indirect evidence is relevant:"
             )
             for i, e in enumerate(indirect_evidence[:3], 1):
-                excerpt_summary = e.excerpt[:280].strip()
-                if len(e.excerpt) > 280:
+                excerpt_summary = TextProcessor.truncate_at_sentence(e.excerpt, 280)
+                if len(excerpt_summary) < len(e.excerpt):
                     excerpt_summary += "..."
                 parts.append(f"[{i}] From '{e.doc_title}' ({e.section}): {excerpt_summary}")
         else:
@@ -740,7 +886,7 @@ class AnswerSynthesizer:
             parts.append(
                 f"⚠ Contradictory evidence found in {len(contradictory)} source(s): "
                 + "; ".join(
-                    f"'{e.doc_title}' states: {e.excerpt[:150]}..."
+                    f"'{e.doc_title}' states: {TextProcessor.truncate_at_sentence(e.excerpt, 150)}..."
                     for e in contradictory[:2]
                 )
             )
@@ -863,6 +1009,7 @@ class BioRAGEngine:
         chunk_overlap: int = 64,
         retrieval_top_k: int = 15,
         rerank_top_k: int = 5,
+        synthesizer: AnswerSynthesizer | None = None,
     ):
         self.chunker = DocumentChunker(chunk_size, chunk_overlap)
         self.index = InvertedIndex()
@@ -870,98 +1017,103 @@ class BioRAGEngine:
         self.reranker = Reranker()
         self.evidence_classifier = EvidenceClassifier()
         self.gap_detector = KnowledgeGapDetector()
-        self.synthesizer = AnswerSynthesizer()
+        self.synthesizer = synthesizer if synthesizer is not None else AnswerSynthesizer()
         self.followup_gen = FollowUpGenerator()
 
         self.retrieval_top_k = retrieval_top_k
         self.rerank_top_k = rerank_top_k
 
         self.documents: dict[str, dict] = {}  # doc_id -> metadata
+        self._lock = threading.Lock()  # serialises concurrent add_document / query
 
     def add_document(self, doc_id: str, title: str, text: str, metadata: dict = None) -> int:
         """Add a document to the index. Returns number of chunks created."""
-        chunks = self.chunker.chunk_document(doc_id, title, text)
-        for chunk in chunks:
-            self.index.add_chunk(chunk)
+        with self._lock:
+            chunks = self.chunker.chunk_document(doc_id, title, text)
+            for chunk in chunks:
+                self.index.add_chunk(chunk)
 
-        self.documents[doc_id] = {
-            "id": doc_id,
-            "title": title,
-            "chunks": len(chunks),
-            "metadata": metadata or {},
-        }
-        return len(chunks)
+            self.documents[doc_id] = {
+                "id": doc_id,
+                "title": title,
+                "chunks": len(chunks),
+                "metadata": metadata or {},
+            }
+            return len(chunks)
 
     def query(self, question: str) -> DecisionOutput:
         """
         Full decision-support pipeline for a user query.
         Returns a structured DecisionOutput with evidence, reasoning, and gaps.
         """
-        # 1. Analyze query
-        q_analysis = self.query_analyzer.analyze(question)
+        with self._lock:
+            # 1. Analyze query
+            q_analysis = self.query_analyzer.analyze(question)
 
-        # 2. Retrieve
-        raw_results = self.index.search(
-            q_analysis["expanded_tokens"],
-            top_k=self.retrieval_top_k,
-        )
-
-        # 3. Rerank
-        reranked = self.reranker.rerank(raw_results, q_analysis, top_k=self.rerank_top_k)
-
-        # 4. Build evidence nodes
-        evidence_nodes: list[EvidenceNode] = []
-        for r in reranked:
-            support_type, key_terms = self.evidence_classifier.classify(r.chunk, q_analysis)
-
-            # Normalize score to 0-1 range for relevance display
-            max_score = reranked[0].score if reranked else 1.0
-            relevance = min(1.0, r.score / max(max_score, 0.01))
-
-            node = EvidenceNode(
-                source_id=r.chunk.id,
-                doc_title=r.chunk.doc_title,
-                section=r.chunk.section,
-                excerpt=r.chunk.text[:400],
-                relevance_score=round(relevance, 3),
-                support_type=support_type,
-                key_terms=key_terms,
+            # 2. Retrieve
+            raw_results = self.index.search(
+                q_analysis["expanded_tokens"],
+                top_k=self.retrieval_top_k,
             )
-            evidence_nodes.append(node)
 
-        # 5. Detect knowledge gaps
-        gaps = self.gap_detector.detect_gaps(q_analysis, evidence_nodes, raw_results)
+            # 3. Rerank
+            reranked = self.reranker.rerank(raw_results, q_analysis, top_k=self.rerank_top_k)
 
-        # 6. Synthesize answer + reasoning chain
-        answer, reasoning_chain, confidence = self.synthesizer.synthesize(
-            q_analysis, evidence_nodes, gaps
-        )
+            # 4. Build evidence nodes
+            evidence_nodes: list[EvidenceNode] = []
+            for r in reranked:
+                support_type, key_terms = self.evidence_classifier.classify(r.chunk, q_analysis)
 
-        # 7. Generate follow-up questions
-        follow_ups = self.followup_gen.generate(q_analysis, evidence_nodes)
+                # Normalize score to 0-1 range for relevance display
+                max_score = reranked[0].score if reranked else 1.0
+                relevance = min(1.0, r.score / max(max_score, 0.01))
 
-        # 8. Confidence label
-        if confidence >= 0.75:
-            conf_label = "High"
-        elif confidence >= 0.50:
-            conf_label = "Moderate"
-        elif confidence >= 0.25:
-            conf_label = "Low"
-        else:
-            conf_label = "Insufficient"
+                node = EvidenceNode(
+                    source_id=r.chunk.id,
+                    doc_title=r.chunk.doc_title,
+                    section=r.chunk.section,
+                    excerpt=TextProcessor.truncate_at_sentence(r.chunk.text, 400),
+                    relevance_score=round(relevance, 3),
+                    support_type=support_type,
+                    key_terms=key_terms,
+                )
+                evidence_nodes.append(node)
 
-        return DecisionOutput(
-            query=question,
-            answer=answer,
-            confidence=round(confidence, 3),
-            confidence_label=conf_label,
-            evidence=evidence_nodes,
-            reasoning_chain=reasoning_chain,
-            knowledge_gaps=gaps,
-            follow_up_questions=follow_ups,
-            sources_used=len(set(e.doc_title for e in evidence_nodes)),
-            total_chunks_searched=len(self.index.chunks),
-        )
+            # 5. Detect knowledge gaps
+            gaps = self.gap_detector.detect_gaps(
+                q_analysis, evidence_nodes, raw_results, self.index.doc_count
+            )
+
+            # 6. Synthesize answer + reasoning chain
+            answer, reasoning_chain, confidence = self.synthesizer.synthesize(
+                q_analysis, evidence_nodes, gaps
+            )
+
+            # 7. Generate follow-up questions
+            follow_ups = self.followup_gen.generate(q_analysis, evidence_nodes)
+
+            # 8. Confidence label
+            if confidence >= 0.75:
+                conf_label = "High"
+            elif confidence >= 0.50:
+                conf_label = "Moderate"
+            elif confidence >= 0.25:
+                conf_label = "Low"
+            else:
+                conf_label = "Insufficient"
+
+            return DecisionOutput(
+                query=question,
+                answer=answer,
+                confidence=round(confidence, 3),
+                confidence_label=conf_label,
+                evidence=evidence_nodes,
+                reasoning_chain=reasoning_chain,
+                knowledge_gaps=gaps,
+                follow_up_questions=follow_ups,
+                sources_used=len(set(e.doc_title for e in evidence_nodes)),
+                total_chunks_searched=len(self.index.chunks),
+            )
 
     def get_corpus_stats(self) -> dict:
         """Return statistics about the indexed corpus.
@@ -970,29 +1122,30 @@ class BioRAGEngine:
         ``full_text_documents`` and ``abstract_only_documents`` counts reflect
         how many articles have complete body text versus abstract only.
         """
-        idx_stats = self.index.stats()
-        full_text = sum(
-            1 for d in self.documents.values()
-            if d["metadata"].get("has_full_text", False)
-        )
-        return {
-            "documents": len(self.documents),
-            "chunks": idx_stats["total_chunks"],
-            "unique_terms": idx_stats["unique_terms"],
-            "avg_chunk_length": idx_stats["avg_chunk_length"],
-            "full_text_documents": full_text,
-            "abstract_only_documents": len(self.documents) - full_text,
-            "document_list": [
-                {
-                    "id": d["id"],
-                    "title": d["title"],
-                    "chunks": d["chunks"],
-                    "source": d["metadata"].get("source", "local"),
-                    "has_full_text": d["metadata"].get("has_full_text", True),
-                }
-                for d in self.documents.values()
-            ],
-        }
+        with self._lock:
+            idx_stats = self.index.stats()
+            full_text = sum(
+                1 for d in self.documents.values()
+                if d["metadata"].get("has_full_text", False)
+            )
+            return {
+                "documents": len(self.documents),
+                "chunks": idx_stats["total_chunks"],
+                "unique_terms": idx_stats["unique_terms"],
+                "avg_chunk_length": idx_stats["avg_chunk_length"],
+                "full_text_documents": full_text,
+                "abstract_only_documents": len(self.documents) - full_text,
+                "document_list": [
+                    {
+                        "id": d["id"],
+                        "title": d["title"],
+                        "chunks": d["chunks"],
+                        "source": d["metadata"].get("source", "local"),
+                        "has_full_text": d["metadata"].get("has_full_text", True),
+                    }
+                    for d in self.documents.values()
+                ],
+            }
 
     def to_dict(self, output: DecisionOutput) -> dict:
         """Serialize a DecisionOutput to a plain dict."""

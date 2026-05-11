@@ -35,8 +35,15 @@ python cli.py --demo
 python cli.py --ingest "alzheimer's disease biomarkers"
 python cli.py --ingest "alzheimer's disease biomarkers" --ingest-max 25
 
-# Run the ingestion script standalone
-python ingestion_pubmed.py
+# Ingest and persist new papers to data/sample_corpus.py (idempotent — skips existing IDs)
+python cli.py --ingest "alzheimer's disease biomarkers" --ingest-max 25 --save-corpus
+
+# Run the ingestion script standalone (supports --query, --max-results, --save-corpus)
+python ingestion_pubmed.py --query "alzheimer's disease biomarkers" --max-results 10 --save-corpus
+
+# Run retrieval evals (MRR + NDCG@K for BM25 vs reranker)
+python evals/retrieval_eval.py
+python evals/retrieval_eval.py --alzheimer-only --verbose
 
 # Start API server (requires: pip install fastapi uvicorn pydantic)
 python server.py
@@ -153,15 +160,16 @@ Use biorag corpus_stats to show the current corpus
 2. **PMC link resolution** — `elink` maps each PMID to a PMC ID (if the
    article has open-access full text).
 3. **Full-text fetch** — `efetch db=pmc` retrieves JATS XML; the parser
-   extracts all `<sec>` / `<p>` elements, preserving section headings.
+   strips inline citation markers (`<xref ref-type="bibr">`) before text
+   extraction, then extracts all `<sec>` / `<p>` elements with section headings.
 4. **Abstract fallback** — PMIDs without a PMC record are fetched from
    `efetch db=pubmed` and only the abstract is indexed.
 
 Metadata stored per document: `source` (`"pubmed_central"` or `"pubmed"`),
 `has_full_text` (bool), `pmcid`, `pmid`, `year`, `journal`.
 
-`ingest_pubmed()` accepts an optional `engine` argument so you can augment
-an existing corpus rather than starting fresh:
+`ingest_pubmed()` accepts an optional `engine` argument and a `save_corpus`
+flag to persist results to `data/sample_corpus.py`:
 
 ```python
 from ingestion_pubmed import ingest_pubmed
@@ -169,7 +177,83 @@ from core.rag_engine import BioRAGEngine
 
 engine = BioRAGEngine()
 ingest_pubmed("CRISPR cancer therapy", max_results=20, engine=engine)
+
+# Persist new papers to sample_corpus.py (skips already-present doc IDs)
+ingest_pubmed("alzheimer's disease biomarkers", max_results=25,
+              engine=engine, save_corpus=True)
 ```
+
+### Citation cleaning
+
+Two layers strip citation number artifacts from ingested text:
+
+1. **XML layer** (`_strip_citation_xrefs`): removes `<xref ref-type="bibr">` elements
+   from JATS XML in-place before `itertext()` runs. Handles PMC full-text papers.
+
+2. **Regex layer** (`TextProcessor.clean_text`): five patterns covering both no-space
+   (`.7,8`, `,3`) and spaced (`. 1 Word`, `) 9 and`, ` 31 , 32 , 33 Word`, `, 37 and`)
+   citation formats. Applied at chunking time, so already-stored corpus text is cleaned
+   automatically on the next engine load.
+
+Single inline citations without punctuation context (`eQTLGen 38 yielded`,
+`50 million individuals`) are intentionally left untouched — they cannot be
+distinguished from real measurements without NLP.
+
+---
+
+## Retrieval Evals
+
+The `evals/` directory contains a harness that measures retrieval quality at two
+pipeline stages independently — BM25 alone vs. BM25 + reranker — so improvements or
+regressions are attributable to a specific stage.
+
+### Files
+
+| File | Purpose |
+|---|---|
+| `evals/ground_truth.py` | `EVAL_QUERIES`: 16 `RetrievalQuery` objects with hand-labelled `{doc_id: grade}` relevance dicts. 7 queries focus on Alzheimer's disease (`ALZHEIMER_QUERIES`). |
+| `evals/retrieval_eval.py` | `RetrievalEvaluator` class + CLI runner. Aggregates chunk scores to document level (max-pooling), then computes MRR and NDCG@K. |
+
+### Metrics
+
+- **MRR@K** — reciprocal rank of the first relevant doc in top-K. Good for decision-support
+  where the user stops at the first useful answer.
+- **NDCG@K** — graded DCG (grade 2 = direct, grade 1 = partial, grade 0 = irrelevant).
+  Penalises burying a high-relevance document deep in the list.
+
+### Running
+
+```bash
+python evals/retrieval_eval.py                      # all 16 queries
+python evals/retrieval_eval.py --alzheimer-only     # AD subset only
+python evals/retrieval_eval.py --verbose            # per-query top-3 vs ground truth
+python evals/retrieval_eval.py --ks 1 5 10          # custom K values
+```
+
+### Maintaining the ground truth
+
+After ingesting new papers, add entries to the relevant list in `evals/ground_truth.py`:
+
+```python
+RetrievalQuery(
+    query_id="Q17",
+    query="What is the role of APOE4 in Alzheimer's disease risk?",
+    intent="mechanism",
+    relevant_docs={
+        "pmid_<new_doc_id>": 2,   # directly addresses the query
+        "neuro_2026_001": 1,       # tangentially relevant
+    },
+),
+```
+
+The `EVAL_QUERIES` list at the bottom of the file imports all sub-lists — add your new
+query to the appropriate sub-list and it will be picked up automatically.
+
+### What the Δ column reveals
+
+A negative NDCG@3/5 delta (Reranked − BM25) means the reranker's `rerank_top_k` budget
+is cutting documents that are partially relevant to multi-document queries. The fix is
+to raise `rerank_top_k` or adjust `Reranker.SECTION_WEIGHTS` for the affected intent.
 
 ---
 
