@@ -1,4 +1,4 @@
-# BioRAG — Decision-Support RAG System
+# BioRAG: Decision-Support RAG System
 
 A production-grade **Retrieval-Augmented Generation** engine for scientific and biomedical
 documents, designed as a **decision-support system** — not a simple chatbot.
