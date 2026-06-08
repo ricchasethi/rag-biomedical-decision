@@ -292,6 +292,62 @@ queries there after ingesting new papers to keep the eval set growing with the c
 
 ---
 
+## Answer Quality Evals (LLM-as-Judge)
+
+While the retrieval eval measures *whether the right document was found*, the answer
+quality eval measures *whether the answer said the right thing* — a separate failure mode
+that retrieval metrics cannot detect.
+
+`evals/answer_eval.py` runs `BioRAGEngine.query()` for each eval query and passes the
+answer to Claude as an independent judge, scoring it on a five-dimension rubric (max 7
+points per query):
+
+| Dimension | Max | What it checks |
+|---|---|---|
+| Semantic Coverage | 2 | Same specific biological conclusion, not just the same topic area |
+| Entity Coverage | 2 | All expected genes/markers/drugs named in the correct context |
+| Directional Agreement | 1 | Direction of effect (elevated/decreased/no effect) explicitly stated and correct |
+| Quantitative Detail | 1 | At least one magnitude or statistic consistent with the reference |
+| Contextual Accuracy | 1 | Finding placed in the claim-specific context (timepoint, tissue, subgroup) |
+
+```bash
+# Score all 10 reference claims (requires ANTHROPIC_API_KEY)
+python evals/answer_eval.py
+
+# Alzheimer's subset only (4 claims)
+python evals/answer_eval.py --alzheimer-only
+
+# Full answer + judge rationale per query
+python evals/answer_eval.py --verbose
+
+# Use ClaudeSynthesizer for answers
+python evals/answer_eval.py --llm
+
+# Combined table: retrieval MRR/NDCG alongside answer quality scores
+python evals/answer_eval.py --with-retrieval
+```
+
+Sample output:
+
+```
+  Dimension                    Mean   Max  Bar
+  ──────────────────────────────────────────────────
+  Semantic Coverage            1.80  /2    █████
+  Entity Coverage              1.40  /2    ████░
+  Directional Agreement        0.90  /1    ████░
+  Quantitative Detail          0.60  /1    ███░░
+  Contextual Accuracy          0.80  /1    ████░
+  ──────────────────────────────────────────────────
+  Total Score                  5.50  /7
+```
+
+**Ground truth** is in `evals/answer_ground_truth.py` as `ANSWER_CLAIMS` — 10
+`AnswerClaim` objects with `reference_claim`, `expected_entities`, `expected_direction`,
+and `expected_context` fields. Add new claims alongside new retrieval queries to keep
+both eval sets growing with the corpus.
+
+---
+
 ## Key Design Decisions
 
 ### Why BM25, not dense embeddings?
@@ -372,8 +428,10 @@ biorag/
 ├── data/
 │   └── sample_corpus.py    # Biomedical corpus sourced from PubMed Central (citation-cleaned)
 ├── evals/
-│   ├── ground_truth.py     # 16 annotated queries with doc-level relevance grades (0/1/2)
-│   └── retrieval_eval.py   # MRR and NDCG@K harness — evaluates BM25 vs reranker separately
+│   ├── ground_truth.py        # 16 RetrievalQuery objects with doc-level relevance grades (0/1/2)
+│   ├── retrieval_eval.py      # MRR and NDCG@K harness — evaluates BM25 vs reranker separately
+│   ├── answer_ground_truth.py # 10 AnswerClaim objects with reference claims and rubric targets
+│   └── answer_eval.py         # LLM-as-judge harness — 5-dimension rubric scored by Claude
 ├── tests/
 │   └── test_biorag.py      # 26 unit + integration tests
 ├── server.py               # FastAPI REST server (includes /ingest endpoint)

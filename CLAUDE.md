@@ -207,6 +207,73 @@ distinguished from real measurements without NLP.
 
 ---
 
+## Answer Quality Evals (LLM-as-Judge)
+
+`evals/answer_eval.py` scores the prose answer produced by `BioRAGEngine.query()` against
+hand-authored reference claims using Claude as an independent judge.
+
+### Files
+
+| File | Purpose |
+|---|---|
+| `evals/answer_ground_truth.py` | `ANSWER_CLAIMS`: 10 `AnswerClaim` objects covering all four corpus documents. Each claim has `reference_claim`, `expected_entities`, `expected_direction`, and `expected_context`. |
+| `evals/answer_eval.py` | `AnswerEvaluator` class + CLI runner. Runs `engine.query()` per query, then calls Claude via `tool_use` to score the answer on five rubric dimensions. |
+
+### Rubric (per query, max 7 points)
+
+| Dimension | Max | Description |
+|---|---|---|
+| Semantic Coverage | 2 | Does the answer address the right phenomenon (not just the topic area)? |
+| Entity Coverage | 2 | Are the specific genes/markers/drugs named in the correct context? |
+| Directional Agreement | 1 | Does the stated direction of effect match the claim (elevated/decreased/no effect)? |
+| Quantitative Detail | 1 | Are magnitudes or statistics consistent with the claim? |
+| Contextual Accuracy | 1 | Is the finding placed in the claim-specific context (timepoint, tissue, subgroup)? |
+
+### Running
+
+```bash
+# All 10 reference claims
+python evals/answer_eval.py
+
+# Alzheimer's subset (4 claims)
+python evals/answer_eval.py --alzheimer-only
+
+# Full answer text + judge rationale per query
+python evals/answer_eval.py --verbose
+
+# Use ClaudeSynthesizer for answers (requires ANTHROPIC_API_KEY)
+python evals/answer_eval.py --llm
+
+# Side-by-side table: retrieval metrics (MRR/NDCG) vs answer quality scores
+python evals/answer_eval.py --with-retrieval
+```
+
+### Key insight this eval reveals
+
+The retrieval eval (MRR/NDCG) measures whether the right document was found.
+The answer eval measures whether the answer said the right thing. A system can
+score MRR=1.0 while still missing the direction of effect or omitting key entities
+— the combined `--with-retrieval` table makes this visible.
+
+### Adding new reference claims
+
+Append to the relevant list in `evals/answer_ground_truth.py`:
+
+```python
+AnswerClaim(
+    query_id="Q17",
+    reference_claim="APOE4 carriers have a 3–4× increased risk of late-onset Alzheimer's disease.",
+    expected_entities=["APOE4", "late-onset", "risk"],
+    expected_direction="increased risk in APOE4 carriers",
+    expected_context="late-onset Alzheimer's disease, genetic risk factor",
+),
+```
+
+The `query_id` must match an entry in `evals/ground_truth.py`. Add the corresponding
+`RetrievalQuery` there first if the query is new.
+
+---
+
 ## Retrieval Evals
 
 The `evals/` directory contains a harness that measures retrieval quality at two
