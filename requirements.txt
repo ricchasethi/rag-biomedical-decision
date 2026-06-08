@@ -59,3 +59,12 @@ prometheus-fastapi-instrumentator>=6.1.0  # Prometheus metrics endpoint
 
 # ── Optional: MCP server ───────────────────────────
 mcp[cli]>4.13.0                     # MCP server
+
+# ── Optional: Answer quality evals (LLM-as-judge) ──
+# Requires compatible langchain stack — pin these together.
+ragas==0.1.21                        # RAG evaluation framework (LabelledRubricsScore, AspectCritique)
+langchain==0.2.17                    # Required by ragas 0.1.21
+langchain-core==0.2.43               # Must be <0.3.0 for ragas 0.1.21 compatibility
+langchain-community==0.2.19          # Required by ragas 0.1.21
+langchain-anthropic==0.1.23          # Claude judge via LangChain wrapper
+langchain-openai==0.1.25             # Transitive dep of ragas (BYO key if used)
