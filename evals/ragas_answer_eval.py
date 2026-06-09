@@ -122,12 +122,53 @@ def build_metrics(llm: LangchainLLMWrapper) -> dict:
         ),
     )
 
+    source_attribution = AspectCritique(
+        name="source_attribution",
+        llm=llm,
+        definition=(
+            "Does the answer include inline citations (e.g. [1], [2]) that link "
+            "every substantive factual claim to a numbered source excerpt? "
+            "Score 1 if every factual claim has at least one inline citation, "
+            "0 if any factual claim is made without a citation or if no citations appear."
+        ),
+    )
+
+    evidence_strength = AspectCritique(
+        name="evidence_strength",
+        llm=llm,
+        definition=(
+            "Does the answer explicitly name the type or quality of evidence "
+            "supporting its findings — such as 'meta-analysis', 'RCT', 'randomised "
+            "controlled trial', 'in vitro study', 'cohort study', 'systematic review', "
+            "or a specific sample size (e.g. 'n = 636', '12 RCTs')? "
+            "Score 1 if at least one evidence type or study design is named, "
+            "0 if findings are stated without any characterisation of the evidence base."
+        ),
+    )
+
+    uncertainty_calibration = AspectCritique(
+        name="uncertainty_calibration",
+        llm=llm,
+        definition=(
+            "Does the answer calibrate its expressed confidence to the strength of "
+            "the evidence? Strong evidence (e.g. large RCT meta-analysis with low "
+            "heterogeneity) should be stated assertively. Weak or preliminary evidence "
+            "should be hedged ('suggests', 'preliminary findings indicate', 'limited "
+            "evidence'). Score 1 if confidence language matches evidence quality, "
+            "0 if the answer uses uniform assertiveness regardless of evidence strength "
+            "or over-hedges findings backed by strong evidence."
+        ),
+    )
+
     return {
         "semantic_coverage": semantic_coverage,
         "entity_coverage": entity_coverage,
         "directional_agreement": directional_agreement,
         "quantitative_detail": quantitative_detail,
         "contextual_accuracy": contextual_accuracy,
+        "source_attribution": source_attribution,
+        "evidence_strength": evidence_strength,
+        "uncertainty_calibration": uncertainty_calibration,
     }
 
 
@@ -135,11 +176,14 @@ def build_metrics(llm: LangchainLLMWrapper) -> dict:
 
 @dataclass
 class RagasRubricScores:
-    semantic_coverage: float      # 0-2 (mapped from RAGAS 1-3)
-    entity_coverage: float        # 0-2 (mapped from RAGAS 1-3)
-    directional_agreement: float  # 0 or 1
-    quantitative_detail: float    # 0 or 1
-    contextual_accuracy: float    # 0 or 1
+    semantic_coverage: float        # 0-2 (mapped from RAGAS 1-3)
+    entity_coverage: float          # 0-2 (mapped from RAGAS 1-3)
+    directional_agreement: float    # 0 or 1
+    quantitative_detail: float      # 0 or 1
+    contextual_accuracy: float      # 0 or 1
+    source_attribution: float       # 0 or 1
+    evidence_strength: float        # 0 or 1
+    uncertainty_calibration: float  # 0 or 1
 
     @property
     def total(self) -> float:
@@ -149,6 +193,9 @@ class RagasRubricScores:
             + self.directional_agreement
             + self.quantitative_detail
             + self.contextual_accuracy
+            + self.source_attribution
+            + self.evidence_strength
+            + self.uncertainty_calibration
         )
 
 
@@ -264,6 +311,9 @@ class RagasAnswerEvaluator:
                 directional_agreement=float(scores_df["directional_agreement"].iloc[i]),
                 quantitative_detail=float(scores_df["quantitative_detail"].iloc[i]),
                 contextual_accuracy=float(scores_df["contextual_accuracy"].iloc[i]),
+                source_attribution=float(scores_df["source_attribution"].iloc[i]),
+                evidence_strength=float(scores_df["evidence_strength"].iloc[i]),
+                uncertainty_calibration=float(scores_df["uncertainty_calibration"].iloc[i]),
             )
             per_query.append(RagasQueryResult(
                 query_id=qid,
@@ -274,7 +324,8 @@ class RagasAnswerEvaluator:
         n = len(per_query)
         mean_total = sum(r.rubric.total for r in per_query) / n
         dims = ["semantic_coverage", "entity_coverage", "directional_agreement",
-                "quantitative_detail", "contextual_accuracy"]
+                "quantitative_detail", "contextual_accuracy",
+                "source_attribution", "evidence_strength", "uncertainty_calibration"]
         mean_by_dim = {
             d: sum(getattr(r.rubric, d) for r in per_query) / n
             for d in dims
@@ -297,11 +348,14 @@ def print_ragas_report(report: RagasEvalReport) -> None:
     print(f"{'━' * W}")
 
     dim_labels = {
-        "semantic_coverage":     ("Semantic Coverage",     2),
-        "entity_coverage":       ("Entity Coverage",       2),
-        "directional_agreement": ("Directional Agreement", 1),
-        "quantitative_detail":   ("Quantitative Detail",   1),
-        "contextual_accuracy":   ("Contextual Accuracy",   1),
+        "semantic_coverage":       ("Semantic Coverage",       2),
+        "entity_coverage":         ("Entity Coverage",         2),
+        "directional_agreement":   ("Directional Agreement",   1),
+        "quantitative_detail":     ("Quantitative Detail",     1),
+        "contextual_accuracy":     ("Contextual Accuracy",     1),
+        "source_attribution":      ("Source Attribution",      1),
+        "evidence_strength":       ("Evidence Strength",       1),
+        "uncertainty_calibration": ("Uncertainty Calibration", 1),
     }
     print(f"\n  {'Dimension':<26} {'Mean':>6}  {'Max':>4}")
     print(f"  {'─' * 44}")
@@ -309,46 +363,47 @@ def print_ragas_report(report: RagasEvalReport) -> None:
         mean = report.mean_by_dimension[key]
         print(f"  {label:<26} {mean:>6.2f}  /{max_v}")
     print(f"  {'─' * 44}")
-    print(f"  {'Total Score':<26} {report.mean_total:>6.2f}  /7")
+    print(f"  {'Total Score':<26} {report.mean_total:>6.2f}  /10")
 
-    print(f"\n  {'ID':<5} {'Sem':>4} {'Ent':>4} {'Dir':>4} {'Qty':>4} {'Ctx':>4} {'Tot':>5}")
-    print(f"  {'─' * 40}")
+    print(f"\n  {'ID':<5} {'Sem':>4} {'Ent':>4} {'Dir':>4} {'Qty':>4} {'Ctx':>4} {'Src':>4} {'Evd':>4} {'Unc':>4} {'Tot':>6}")
+    print(f"  {'─' * 56}")
     for r in report.per_query:
         rb = r.rubric
         print(
             f"  {r.query_id:<5} {rb.semantic_coverage:>4.1f} {rb.entity_coverage:>4.1f} "
             f"{rb.directional_agreement:>4.1f} {rb.quantitative_detail:>4.1f} "
-            f"{rb.contextual_accuracy:>4.1f} {rb.total:>5.1f}"
+            f"{rb.contextual_accuracy:>4.1f} {rb.source_attribution:>4.1f} "
+            f"{rb.evidence_strength:>4.1f} {rb.uncertainty_calibration:>4.1f} {rb.total:>6.1f}"
         )
     print(f"\n{'━' * W}\n")
 
 
 def print_comparison(ragas_report: RagasEvalReport) -> None:
     """Side-by-side: our custom judge vs RAGAS judge (hardcoded rule-based results)."""
-    # Rule-based results from the previous run
+    # 8-dimension scores (sem, ent, dir, qty, ctx, src, evd, unc, total) — max 10
     custom_rule = {
-        "Q01": (1, 0, 0, 0, 1, 2),
-        "Q02": (1, 1, 0, 0, 1, 3),
-        "Q03": (1, 0, 0, 0, 1, 2),
-        "Q07": (1, 1, 0, 0, 1, 3),
-        "Q08": (2, 2, 1, 1, 1, 7),
-        "Q09": (2, 2, 1, 1, 1, 7),
-        "Q11": (1, 2, 1, 0, 1, 5),
-        "Q12": (1, 1, 0, 0, 1, 3),
-        "Q13": (1, 2, 0, 0, 1, 4),
-        "Q14": (1, 1, 1, 0, 1, 4),
+        "Q01": (1, 0, 0, 0, 1, 1, 1, 1,  5),
+        "Q02": (1, 1, 0, 0, 0, 1, 1, 0,  4),
+        "Q03": (1, 0, 0, 0, 1, 1, 1, 0,  4),
+        "Q07": (1, 1, 0, 0, 0, 0, 0, 0,  2),
+        "Q08": (2, 2, 1, 1, 1, 1, 1, 1, 10),
+        "Q09": (2, 2, 1, 1, 1, 1, 1, 1, 10),
+        "Q11": (1, 2, 1, 0, 1, 1, 0, 0,  6),
+        "Q12": (1, 1, 0, 0, 1, 1, 0, 0,  4),
+        "Q13": (1, 1, 0, 0, 1, 1, 0, 0,  4),
+        "Q14": (1, 1, 1, 0, 1, 1, 0, 0,  5),
     }
     custom_llm = {
-        "Q01": (1, 1, 0, 0, 1, 3),
-        "Q02": (1, 1, 0, 0, 1, 3),
-        "Q03": (1, 1, 1, 0, 1, 4),
-        "Q07": (2, 2, 1, 0, 1, 6),
-        "Q08": (2, 2, 1, 1, 1, 7),
-        "Q09": (2, 2, 1, 1, 1, 7),
-        "Q11": (1, 2, 1, 0, 1, 5),
-        "Q12": (1, 1, 1, 0, 1, 4),
-        "Q13": (2, 2, 1, 0, 1, 6),
-        "Q14": (2, 2, 1, 1, 1, 7),
+        "Q01": (1, 1, 0, 0, 1, 1, 0, 1,  5),
+        "Q02": (1, 1, 0, 0, 1, 1, 1, 1,  6),
+        "Q03": (1, 1, 1, 0, 1, 1, 0, 1,  6),
+        "Q07": (2, 2, 1, 0, 1, 1, 0, 1,  8),
+        "Q08": (2, 2, 1, 1, 1, 1, 1, 1, 10),
+        "Q09": (2, 2, 1, 1, 1, 1, 1, 1, 10),
+        "Q11": (1, 2, 1, 0, 1, 1, 0, 1,  7),
+        "Q12": (1, 2, 1, 0, 1, 1, 0, 0,  6),
+        "Q13": (1, 2, 1, 0, 1, 1, 0, 1,  7),
+        "Q14": (2, 2, 1, 1, 1, 1, 1, 1, 10),
     }
 
     W = 88
@@ -361,8 +416,8 @@ def print_comparison(ragas_report: RagasEvalReport) -> None:
     ragas_by_id = {r.query_id: r.rubric.total for r in ragas_report.per_query}
     for qid in sorted(ragas_by_id.keys()):
         r_tot = ragas_by_id[qid]
-        c_rule = custom_rule.get(qid, (0,)*6)[-1]
-        c_llm  = custom_llm.get(qid, (0,)*6)[-1]
+        c_rule = custom_rule.get(qid, (0,)*9)[-1]
+        c_llm  = custom_llm.get(qid, (0,)*9)[-1]
         delta = r_tot - c_rule
         print(f"  {qid:<5} {c_rule:>12} {c_llm:>11} {r_tot:>11.1f}  {delta:>+22.1f}")
 

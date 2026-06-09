@@ -217,9 +217,9 @@ hand-authored reference claims using Claude as an independent judge.
 | File | Purpose |
 |---|---|
 | `evals/answer_ground_truth.py` | `ANSWER_CLAIMS`: 10 `AnswerClaim` objects covering all four corpus documents. Each claim has `reference_claim`, `expected_entities`, `expected_direction`, and `expected_context`. |
-| `evals/answer_eval.py` | `AnswerEvaluator` class + CLI runner. Runs `engine.query()` per query, then calls Claude via `tool_use` to score the answer on five rubric dimensions. |
+| `evals/answer_eval.py` | `AnswerEvaluator` class + CLI runner. Runs `engine.query()` per query, then calls Claude via `tool_use` to score the answer on eight rubric dimensions. |
 
-### Rubric (per query, max 7 points)
+### Rubric (per query, max 10 points)
 
 | Dimension | Max | Description |
 |---|---|---|
@@ -228,6 +228,9 @@ hand-authored reference claims using Claude as an independent judge.
 | Directional Agreement | 1 | Does the stated direction of effect match the claim (elevated/decreased/no effect)? |
 | Quantitative Detail | 1 | Are magnitudes or statistics consistent with the claim? |
 | Contextual Accuracy | 1 | Is the finding placed in the claim-specific context (timepoint, tissue, subgroup)? |
+| Source Attribution | 1 | Are all factual claims linked to inline numbered citations ([1], [2], etc.)? |
+| Evidence Strength | 1 | Is the study design / evidence type explicitly named (RCT, meta-analysis, cohort, in vitro)? |
+| Uncertainty Calibration | 1 | Does the expressed confidence match the evidence quality (assertive for strong evidence, hedged for weak)? |
 
 ### Running
 

@@ -299,7 +299,7 @@ quality eval measures *whether the answer said the right thing* — a separate f
 that retrieval metrics cannot detect.
 
 `evals/answer_eval.py` runs `BioRAGEngine.query()` for each eval query and passes the
-answer to Claude as an independent judge, scoring it on a five-dimension rubric (max 7
+answer to Claude as an independent judge, scoring it on an eight-dimension rubric (max 10
 points per query):
 
 | Dimension | Max | What it checks |
@@ -309,6 +309,9 @@ points per query):
 | Directional Agreement | 1 | Direction of effect (elevated/decreased/no effect) explicitly stated and correct |
 | Quantitative Detail | 1 | At least one magnitude or statistic consistent with the reference |
 | Contextual Accuracy | 1 | Finding placed in the claim-specific context (timepoint, tissue, subgroup) |
+| Source Attribution | 1 | Every factual claim accompanied by inline citations ([1], [2], etc.) |
+| Evidence Strength | 1 | Study design or evidence type explicitly named (RCT, meta-analysis, cohort, in vitro) |
+| Uncertainty Calibration | 1 | Expressed confidence matches evidence quality — assertive for strong evidence, hedged for weak |
 
 ```bash
 # Score all 10 reference claims (requires ANTHROPIC_API_KEY)
@@ -327,18 +330,21 @@ python evals/answer_eval.py --llm
 python evals/answer_eval.py --with-retrieval
 ```
 
-Sample output:
+Sample output (LLM synthesizer):
 
 ```
   Dimension                    Mean   Max  Bar
   ──────────────────────────────────────────────────
-  Semantic Coverage            1.80  /2    █████
-  Entity Coverage              1.40  /2    ████░
-  Directional Agreement        0.90  /1    ████░
-  Quantitative Detail          0.60  /1    ███░░
-  Contextual Accuracy          0.80  /1    ████░
+  Semantic Coverage            1.40  /2    ████░
+  Entity Coverage              1.70  /2    ████░
+  Directional Agreement        0.80  /1    ████░
+  Quantitative Detail          0.30  /1    ██░░░
+  Contextual Accuracy          1.00  /1    █████
+  Source Attribution           1.00  /1    █████
+  Evidence Strength            0.40  /1    ██░░░
+  Uncertainty Calibration      0.90  /1    ████░
   ──────────────────────────────────────────────────
-  Total Score                  5.50  /7
+  Total Score                  7.50  /10
 ```
 
 **Ground truth** is in `evals/answer_ground_truth.py` as `ANSWER_CLAIMS` — 10
@@ -431,7 +437,7 @@ biorag/
 │   ├── ground_truth.py        # 16 RetrievalQuery objects with doc-level relevance grades (0/1/2)
 │   ├── retrieval_eval.py      # MRR and NDCG@K harness — evaluates BM25 vs reranker separately
 │   ├── answer_ground_truth.py # 10 AnswerClaim objects with reference claims and rubric targets
-│   └── answer_eval.py         # LLM-as-judge harness — 5-dimension rubric scored by Claude
+│   └── answer_eval.py         # LLM-as-judge harness — 8-dimension rubric scored by Claude
 ├── tests/
 │   └── test_biorag.py      # 26 unit + integration tests
 ├── server.py               # FastAPI REST server (includes /ingest endpoint)

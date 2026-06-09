@@ -4,15 +4,18 @@ Answer Quality Eval — LLM-as-Judge
 Evaluates the prose answer produced by BioRAGEngine.query() against a
 hand-authored reference claim using Claude as an independent judge.
 
-The judge scores each answer on five rubric dimensions (from ideas.md):
+The judge scores each answer on eight rubric dimensions:
 
-  Semantic Coverage    (0–2)  Does the answer address the right phenomenon?
-  Entity Coverage      (0–2)  Are the specific genes/markers/drugs named?
-  Directional Agreement (0–1) Does the stated direction of effect match?
-  Quantitative Detail   (0–1) Are magnitudes / statistics consistent?
-  Contextual Accuracy   (0–1) Is the finding placed in the correct context?
+  Semantic Coverage       (0–2)  Does the answer address the right phenomenon?
+  Entity Coverage         (0–2)  Are the specific genes/markers/drugs named?
+  Directional Agreement   (0–1)  Does the stated direction of effect match?
+  Quantitative Detail     (0–1)  Are magnitudes / statistics consistent?
+  Contextual Accuracy     (0–1)  Is the finding placed in the correct context?
+  Source Attribution      (0–1)  Are factual claims cited to numbered sources?
+  Evidence Strength       (0–1)  Is the study design / evidence type named?
+  Uncertainty Calibration (0–1)  Does expressed confidence match evidence quality?
 
-Maximum total: 7 points per query.
+Maximum total: 10 points per query.
 
 This is intentionally separate from the retrieval eval (MRR/NDCG) so we can
 show the key insight: good retrieval does not guarantee good answers.  A
@@ -63,7 +66,7 @@ from evals.answer_ground_truth import (
 _JUDGE_TOOL: dict = {
     "name": "score_answer",
     "description": (
-        "Score the AI-generated answer on five biomedical evaluation dimensions "
+        "Score the AI-generated answer on eight biomedical evaluation dimensions "
         "against a reference claim. Fill every field; do not omit any."
     ),
     "input_schema": {
@@ -113,11 +116,45 @@ _JUDGE_TOOL: dict = {
                     "(timepoint, treatment arm, tissue, subgroup, etc.)."
                 ),
             },
+            "source_attribution": {
+                "type": "integer",
+                "enum": [0, 1],
+                "description": (
+                    "0 = factual claims are made without inline citations, or no "
+                    "numbered source references (e.g. [1], [2]) appear in the answer. "
+                    "1 = every substantive factual claim is accompanied by at least "
+                    "one inline citation linking it to a numbered source excerpt."
+                ),
+            },
+            "evidence_strength": {
+                "type": "integer",
+                "enum": [0, 1],
+                "description": (
+                    "0 = findings are stated without naming the type or quality of "
+                    "evidence behind them (no mention of RCT, meta-analysis, cohort, "
+                    "in vitro, case report, systematic review, sample size, etc.). "
+                    "1 = the answer explicitly names the study design or evidence type "
+                    "that supports the finding (e.g. 'meta-analysis of 12 RCTs', "
+                    "'in vitro study', 'prospective cohort of N participants')."
+                ),
+            },
+            "uncertainty_calibration": {
+                "type": "integer",
+                "enum": [0, 1],
+                "description": (
+                    "0 = findings are stated with uniform assertiveness regardless of "
+                    "evidence quality, OR the answer over-hedges findings that are "
+                    "well-established by strong evidence (e.g. large RCT meta-analysis). "
+                    "1 = the answer's confidence language matches the evidence strength: "
+                    "strong evidence → clear assertion; weak/preliminary evidence → "
+                    "appropriate hedging ('suggests', 'preliminary', 'limited evidence')."
+                ),
+            },
             "rationale": {
                 "type": "string",
                 "description": (
-                    "1–2 sentences explaining the scores, noting what the answer "
-                    "got right and what it missed."
+                    "2–3 sentences explaining the scores across all eight dimensions, "
+                    "noting what the answer got right and what it missed."
                 ),
             },
         },
@@ -127,6 +164,9 @@ _JUDGE_TOOL: dict = {
             "directional_agreement",
             "quantitative_detail",
             "contextual_accuracy",
+            "source_attribution",
+            "evidence_strength",
+            "uncertainty_calibration",
             "rationale",
         ],
     },
@@ -137,7 +177,7 @@ You are an expert biomedical evaluator assessing the quality of an \
 AI-generated answer against a reference claim.
 
 Your task is to call the score_answer tool with integer scores for each of \
-the five rubric dimensions. Base your scores strictly on what the AI answer \
+the eight rubric dimensions. Base your scores strictly on what the AI answer \
 explicitly states — do not infer or credit implied knowledge.
 
 Scoring rules:
@@ -155,8 +195,19 @@ required.
 - Contextual accuracy 1: the answer names the specific setting (tissue, \
 condition, subgroup, timepoint) from the reference claim. Generic phrases \
 like "in patients" or "in disease" do not qualify.
+- Source attribution 1: every substantive factual claim in the answer is \
+accompanied by an inline citation such as [1] or [2]. An answer with \
+unsupported assertions scores 0, even if correct.
+- Evidence strength 1: the answer explicitly names the study design or \
+evidence type (e.g. "meta-analysis", "RCT", "in vitro", "cohort study", \
+"n = 636"). Stating a finding without characterising the evidence scores 0.
+- Uncertainty calibration 1: confidence language in the answer matches the \
+evidence quality. Strong evidence (large RCT meta-analysis) → clear \
+assertion. Weak or preliminary evidence → hedged language ("suggests", \
+"preliminary findings indicate"). Uniform assertiveness regardless of \
+evidence strength scores 0.
 
-Call score_answer once with all five scores plus a brief rationale.\
+Call score_answer once with all eight scores plus a rationale.\
 """
 
 
@@ -165,11 +216,14 @@ Call score_answer once with all five scores plus a brief rationale.\
 @dataclass
 class RubricScores:
     """Per-dimension scores returned by the judge for one answer."""
-    semantic_coverage: int      # 0–2
-    entity_coverage: int        # 0–2
-    directional_agreement: int  # 0–1
-    quantitative_detail: int    # 0–1
-    contextual_accuracy: int    # 0–1
+    semantic_coverage: int        # 0–2
+    entity_coverage: int          # 0–2
+    directional_agreement: int    # 0–1
+    quantitative_detail: int      # 0–1
+    contextual_accuracy: int      # 0–1
+    source_attribution: int       # 0–1
+    evidence_strength: int        # 0–1
+    uncertainty_calibration: int  # 0–1
     rationale: str
 
     @property
@@ -180,11 +234,14 @@ class RubricScores:
             + self.directional_agreement
             + self.quantitative_detail
             + self.contextual_accuracy
+            + self.source_attribution
+            + self.evidence_strength
+            + self.uncertainty_calibration
         )
 
     @property
     def max_score(self) -> int:
-        return 7
+        return 10
 
 
 @dataclass
@@ -248,7 +305,7 @@ class AnswerEvaluator:
             f"## Expected direction of effect\n{claim.expected_direction}\n\n"
             f"## Expected context (must be named explicitly)\n{claim.expected_context}\n\n"
             f"## AI-generated answer to evaluate\n{answer}\n\n"
-            "Score the answer on all five dimensions using the score_answer tool."
+            "Score the answer on all eight dimensions using the score_answer tool."
         )
 
     def _judge_answer(self, answer: str, claim: AnswerClaim) -> RubricScores:
@@ -275,6 +332,9 @@ class AnswerEvaluator:
                     directional_agreement=int(inp["directional_agreement"]),
                     quantitative_detail=int(inp["quantitative_detail"]),
                     contextual_accuracy=int(inp["contextual_accuracy"]),
+                    source_attribution=int(inp["source_attribution"]),
+                    evidence_strength=int(inp["evidence_strength"]),
+                    uncertainty_calibration=int(inp["uncertainty_calibration"]),
                     rationale=inp.get("rationale", ""),
                 )
 
@@ -309,7 +369,8 @@ class AnswerEvaluator:
         n = len(results)
         mean_total = sum(r.rubric.total for r in results) / n
         dims = ["semantic_coverage", "entity_coverage", "directional_agreement",
-                "quantitative_detail", "contextual_accuracy"]
+                "quantitative_detail", "contextual_accuracy",
+                "source_attribution", "evidence_strength", "uncertainty_calibration"]
         mean_by_dim = {
             d: sum(getattr(r.rubric, d) for r in results) / n
             for d in dims
@@ -366,11 +427,14 @@ def print_report(report: AnswerEvalReport, verbose: bool = False) -> None:
     print(f"\n  {'Dimension':<26} {'Mean':>6}  {'Max':>4}  Bar")
     print(f"  {'─' * 50}")
     dim_labels = {
-        "semantic_coverage":     ("Semantic Coverage",     2),
-        "entity_coverage":       ("Entity Coverage",       2),
-        "directional_agreement": ("Directional Agreement", 1),
-        "quantitative_detail":   ("Quantitative Detail",   1),
-        "contextual_accuracy":   ("Contextual Accuracy",   1),
+        "semantic_coverage":       ("Semantic Coverage",       2),
+        "entity_coverage":         ("Entity Coverage",         2),
+        "directional_agreement":   ("Directional Agreement",   1),
+        "quantitative_detail":     ("Quantitative Detail",     1),
+        "contextual_accuracy":     ("Contextual Accuracy",     1),
+        "source_attribution":      ("Source Attribution",      1),
+        "evidence_strength":       ("Evidence Strength",       1),
+        "uncertainty_calibration": ("Uncertainty Calibration", 1),
     }
     for key, (label, max_v) in dim_labels.items():
         mean = report.mean_by_dimension[key]
@@ -378,18 +442,20 @@ def print_report(report: AnswerEvalReport, verbose: bool = False) -> None:
         print(f"  {label:<26} {mean:>6.2f}  /{max_v:<3}  {bar}")
 
     print(f"  {'─' * 50}")
-    print(f"  {'Total Score':<26} {report.mean_total:>6.2f}  /7")
-    print(f"\n  Note: total = sum of all five dimensions (max 7 per query)")
+    print(f"  {'Total Score':<26} {report.mean_total:>6.2f}  /10")
+    print(f"\n  Note: total = sum of all eight dimensions (max 10 per query)")
 
     # ── Per-query table ───────────────────────────────────────────────────────
-    print(f"\n  {'ID':<5} {'Sem':>4} {'Ent':>4} {'Dir':>4} {'Qty':>4} {'Ctx':>4} {'Tot':>5}  Conf")
-    print(f"  {'─' * 48}")
+    print(f"\n  {'ID':<5} {'Sem':>4} {'Ent':>4} {'Dir':>4} {'Qty':>4} {'Ctx':>4} {'Src':>4} {'Evd':>4} {'Unc':>4} {'Tot':>6}  Conf")
+    print(f"  {'─' * 62}")
     for r in report.per_query:
         rb = r.rubric
         print(
             f"  {r.query_id:<5} {rb.semantic_coverage:>4} {rb.entity_coverage:>4} "
             f"{rb.directional_agreement:>4} {rb.quantitative_detail:>4} "
-            f"{rb.contextual_accuracy:>4} {rb.total:>5}  {r.engine_confidence:.2f}"
+            f"{rb.contextual_accuracy:>4} {rb.source_attribution:>4} "
+            f"{rb.evidence_strength:>4} {rb.uncertainty_calibration:>4} "
+            f"{rb.total:>6}  {r.engine_confidence:.2f}"
         )
 
     # ── Verbose: full answer + rationale ─────────────────────────────────────
@@ -400,13 +466,13 @@ def print_report(report: AnswerEvalReport, verbose: bool = False) -> None:
             print(f"\n  [{r.query_id}]  {r.query}")
             print(f"  Answer (first 300 chars):")
             print(f"    {r.answer[:300].replace(chr(10), ' ')}")
+            rb = r.rubric
             print(f"  Rubric scores: "
-                  f"Sem={r.rubric.semantic_coverage}/2  "
-                  f"Ent={r.rubric.entity_coverage}/2  "
-                  f"Dir={r.rubric.directional_agreement}/1  "
-                  f"Qty={r.rubric.quantitative_detail}/1  "
-                  f"Ctx={r.rubric.contextual_accuracy}/1  "
-                  f"Total={r.rubric.total}/7")
+                  f"Sem={rb.semantic_coverage}/2  Ent={rb.entity_coverage}/2  "
+                  f"Dir={rb.directional_agreement}/1  Qty={rb.quantitative_detail}/1  "
+                  f"Ctx={rb.contextual_accuracy}/1  Src={rb.source_attribution}/1  "
+                  f"Evd={rb.evidence_strength}/1  Unc={rb.uncertainty_calibration}/1  "
+                  f"Total={rb.total}/10")
             print(f"  Rationale: {r.rubric.rationale}")
 
     print(f"\n{'━' * W}\n")
@@ -423,9 +489,9 @@ def print_combined_report(
     print(f"{'━' * W}")
     print(
         f"\n  {'ID':<5} {'MRR':>6} {'NDCG@3':>7} {'Sem':>4} {'Ent':>4} "
-        f"{'Dir':>4} {'Qty':>4} {'Ctx':>4} {'Tot/7':>6}"
+        f"{'Dir':>4} {'Qty':>4} {'Ctx':>4} {'Src':>4} {'Evd':>4} {'Unc':>4} {'Tot/10':>7}"
     )
-    print(f"  {'─' * 60}")
+    print(f"  {'─' * 74}")
     for r in answer_report.per_query:
         mrr, ndcg3 = retrieval_results.get(r.query_id, (0.0, 0.0))
         rb = r.rubric
@@ -433,7 +499,8 @@ def print_combined_report(
             f"  {r.query_id:<5} {mrr:>6.3f} {ndcg3:>7.3f} "
             f"{rb.semantic_coverage:>4} {rb.entity_coverage:>4} "
             f"{rb.directional_agreement:>4} {rb.quantitative_detail:>4} "
-            f"{rb.contextual_accuracy:>4} {rb.total:>6}"
+            f"{rb.contextual_accuracy:>4} {rb.source_attribution:>4} "
+            f"{rb.evidence_strength:>4} {rb.uncertainty_calibration:>4} {rb.total:>7}"
         )
     print(f"\n  Interpretation: high MRR with low answer score = retrieval works,")
     print(f"  synthesis fails.  Low MRR with any answer score = retrieval is the bottleneck.")
