@@ -37,6 +37,10 @@ python cli.py --llm --show-prompt --query "What biomarkers predict CVD risk in T
 # Demo all preset queries
 python cli.py --demo
 
+# Hybrid retrieval: BM25 + dense (Qdrant) fused via RRF (requires: pip install qdrant-client sentence-transformers)
+python cli.py --hybrid --query "What biomarkers predict CVD risk in T2DM?"
+python cli.py --hybrid --llm --query "What plasma proteins predict Alzheimer's?"
+
 # Ingest PubMed/PMC papers then enter interactive mode (requires: pip install requests)
 python cli.py --ingest "alzheimer's disease biomarkers"
 python cli.py --ingest "alzheimer's disease biomarkers" --ingest-max 25
@@ -44,16 +48,28 @@ python cli.py --ingest "alzheimer's disease biomarkers" --ingest-max 25
 # Ingest and persist new papers to data/sample_corpus.py (idempotent — skips existing IDs)
 python cli.py --ingest "alzheimer's disease biomarkers" --ingest-max 25 --save-corpus
 
-# Run the ingestion script standalone (supports --query, --max-results, --save-corpus)
+# Ingest into a hybrid index (chunks flow to both BM25 and Qdrant)
+python cli.py --hybrid --ingest "alzheimer's disease biomarkers" --ingest-max 25
+
+# Run the ingestion script standalone (supports --query, --max-results, --save-corpus, --hybrid)
 python ingestion_pubmed.py --query "alzheimer's disease biomarkers" --max-results 10 --save-corpus
 
 # Run retrieval evals (MRR + NDCG@K for BM25 vs reranker)
 python evals/retrieval_eval.py
 python evals/retrieval_eval.py --alzheimer-only --verbose
 
+# Four-mode retrieval eval: BM25 / Dense / Hybrid (RRF) / Hybrid+Rerank
+python evals/retrieval_eval.py --hybrid --alzheimer-only --verbose
+
+# Run hybrid retrieval tests
+python tests/test_hybrid_retrieval.py
+
 # Start API server (requires: pip install fastapi uvicorn pydantic)
 python server.py
 # → http://localhost:8000/docs
+
+# Start API server with hybrid retrieval enabled
+BIORAG_HYBRID=1 python server.py
 
 # Start MCP server standalone (requires: pip install "mcp[cli]")
 python mcp_server.py
@@ -73,6 +89,8 @@ BioRAGEngine.query(question)
   │
   ├─ QueryAnalyzer.analyze()          → intent, entities, expanded tokens
   ├─ InvertedIndex.search()           → BM25 retrieval, top-K chunks
+  ├─ DenseRetriever.search()          → Qdrant cosine ANN top-K  ┐  (only when
+  ├─ reciprocal_rank_fusion()         → fuse BM25 + dense via RRF ┘   dense_retriever set)
   ├─ Reranker.rerank()                → section-aware score adjustment + discriminative-token recall penalty
   ├─ EvidenceClassifier.classify()    → direct / indirect / contradictory
   ├─ KnowledgeGapDetector.detect()    → missing data, contradictions, low relevance
@@ -80,10 +98,16 @@ BioRAGEngine.query(question)
   └─ FollowUpGenerator.generate()     → suggested follow-up questions
 ```
 
+The dense-retrieval stage is **optional and injected** (like `ClaudeSynthesizer`). When
+`dense_retriever` is `None` (the default), the pipeline is pure BM25 and `core/rag_engine.py`
+imports nothing external. When set, BM25 and dense results are merged by RRF before reranking;
+the fused score lands in `RetrievedChunk.score`, so every downstream stage is unaffected. See
+the **Hybrid Retrieval** section for details.
+
 ### Key data structures
 
 - `Chunk` — a chunked piece of a document with tokens, section, page
-- `RetrievedChunk` — a `Chunk` with BM25 score and rank
+- `RetrievedChunk` — a `Chunk` with a retrieval score and rank (BM25, or the fused RRF score in hybrid mode)
 - `EvidenceNode` — a classified chunk with relevance score and support type
 - `ReasoningStep` — one step in the reasoning chain with a confidence score
 - `DecisionOutput` — the full structured output returned by `BioRAGEngine.query()`
@@ -304,7 +328,13 @@ python evals/retrieval_eval.py                      # all 16 queries
 python evals/retrieval_eval.py --alzheimer-only     # AD subset only
 python evals/retrieval_eval.py --verbose            # per-query top-3 vs ground truth
 python evals/retrieval_eval.py --ks 1 5 10          # custom K values
+python evals/retrieval_eval.py --hybrid             # four-mode: BM25 / Dense / Hybrid / Hybrid+Rerank
 ```
+
+The `--hybrid` flag swaps `print_report` for `print_hybrid_report`, comparing four modes
+side by side so each stage's contribution is attributable (same philosophy as the BM25-vs-reranker
+Δ column). It builds an in-memory Qdrant index via `build_hybrid_engine()`, so the eval always
+reflects the current corpus. Requires `qdrant-client` + `sentence-transformers`.
 
 ### Maintaining the ground truth
 
@@ -330,6 +360,73 @@ query to the appropriate sub-list and it will be picked up automatically.
 A negative NDCG@3/5 delta (Reranked − BM25) means the reranker's `rerank_top_k` budget
 is cutting documents that are partially relevant to multi-document queries. The fix is
 to raise `rerank_top_k` or adjust `Reranker.SECTION_WEIGHTS` for the affected intent.
+
+---
+
+## Hybrid Retrieval
+
+`hybrid_retrieval.py` adds dense (embedding-based) retrieval alongside BM25 and fuses the
+two with Reciprocal Rank Fusion (RRF). It is **optional and injected** via
+`BioRAGEngine(dense_retriever=...)`, mirroring the `ClaudeSynthesizer` pattern —
+`core/rag_engine.py` stays stdlib-only and imports `hybrid_retrieval` lazily inside
+`query()`, only when a `dense_retriever` is present.
+
+```python
+from hybrid_retrieval import EmbeddingModel, DenseRetriever
+from core.rag_engine import BioRAGEngine
+
+engine = BioRAGEngine(dense_retriever=DenseRetriever(EmbeddingModel()))
+result = engine.query("What plasma biomarkers predict Alzheimer's?")
+```
+
+### Components
+
+| Component | Role |
+|---|---|
+| `EmbeddingModel` | Wraps sentence-transformers. Lazy-loads on first `encode()`; caches vectors by an MD5 of the text. Default model: `pritamdeka/S-PubMedBert-MS-MARCO` (768-dim, PubMed-tuned). |
+| `DenseRetriever` | Owns a Qdrant collection. `add_chunks()` embeds + upserts; `search()` returns `[(chunk_id, cosine_score)]`. |
+| `reciprocal_rank_fusion()` | Merges BM25 + dense rankings: `score = Σ 1/(k + rank_i)`, `k=60`. Returns `RetrievedChunk` list with the fused score. |
+
+### How fusion stays transparent to the rest of the pipeline
+
+After RRF, `RetrievedChunk.score` holds the fused score and the list feeds straight into
+`Reranker.rerank()`. The existing 0–1 normalisation in `query()` (`r.score / max(max_score, …)`)
+handles it, so `EvidenceNode.relevance_score`, the classifier, gaps, and synthesizer are all
+unchanged. `match_terms` is preserved from the BM25 result; dense-only hits get an empty list.
+
+### Qdrant persistence modes
+
+| Mode | Config | Use case |
+|---|---|---|
+| File-based (default) | `DenseRetriever(model)` → `./qdrant_data` | Dev / single process; vectors survive restarts |
+| In-memory | `DenseRetriever(model, qdrant_path=":memory:")` | Tests and evals (fresh each run) |
+| Server | point `DenseRetriever.client` at `QdrantClient(url=...)` | Multi-process production |
+
+`./qdrant_data/` is gitignored. On startup the engine re-adds `SAMPLE_DOCUMENTS`, but
+`add_chunks()` asks Qdrant which point IDs already exist (deterministic `uuid5` per chunk id)
+and embeds only genuinely new chunks — so the embedding model is hit once per chunk over the
+collection's lifetime, not on every launch.
+
+### Wiring across entry points
+
+| Entry point | How to enable |
+|---|---|
+| `cli.py` | `--hybrid` flag |
+| `ingestion_pubmed.py` | `--hybrid` flag (standalone) or `ingest_pubmed(..., dense_retriever=...)` |
+| `server.py` | `BIORAG_HYBRID=1` env var |
+| `evals/retrieval_eval.py` | `--hybrid` flag → four-mode comparison (BM25 / Dense / Hybrid / Hybrid+Rerank) |
+
+### Tuning
+
+- **RRF `rrf_k`** (default 60): lower it to amplify the top-rank bonus; raise it to flatten
+  rankings. A chunk ranked 1st in both lists scores ≈ `2/(rrf_k+1)`.
+- **Embedding model**: pass a different name to `EmbeddingModel(model_name=...)`. Use
+  `fastembed`-compatible models (e.g. `BAAI/bge-small-en-v1.5`, 384-dim) to avoid pulling `torch`.
+- **Candidate depth**: each retriever returns its own `retrieval_top_k` before fusion, so RRF
+  sees up to `2 × retrieval_top_k` candidates.
+
+> Note: `DenseRetriever.search()` uses qdrant-client's `query_points(query=...)`; the older
+> `.search(query_vector=...)` API is deprecated in qdrant-client ≥ 1.18.
 
 ---
 
@@ -391,7 +488,8 @@ surface, add their shared generic tokens to the set.
 ### Upgrading to embedding-based retrieval
 Replace or augment `InvertedIndex.search()`. The reranker, classifier, synthesizer,
 and gap detector are all retrieval-agnostic — they only care about the `RetrievedChunk`
-interface.
+interface. The shipped implementation of this is **hybrid retrieval** (`hybrid_retrieval.py`),
+injected via `BioRAGEngine(dense_retriever=...)` — see the **Hybrid Retrieval** section.
 
 ### Using LLM answer generation
 `llm_synthesizer.py` provides `ClaudeSynthesizer`, a ready-to-use subclass of
@@ -436,6 +534,12 @@ The end-to-end tests use the real sample corpus from `data/sample_corpus.py`.
 Do not mock the corpus in end-to-end tests — the test queries are chosen to have
 known relevant documents.
 
+Hybrid retrieval has its own suite, `tests/test_hybrid_retrieval.py` (run with
+`python tests/test_hybrid_retrieval.py`), covering `EmbeddingModel`, `DenseRetriever`,
+`reciprocal_rank_fusion`, and engine integration. It uses a `FakeEmbeddingModel` and an
+in-memory Qdrant collection so most tests stay fast and offline; only the two `EmbeddingModel`
+tests load the real sentence-transformers model (once, to check dimension and caching).
+
 ---
 
 ## What Not to Do
@@ -448,3 +552,6 @@ known relevant documents.
   in `llm_synthesizer.py` and is injected via `BioRAGEngine(synthesizer=ClaudeSynthesizer())`.
 - Do not return raw BM25 scores to the user — they are not interpretable. Always
   normalize to a 0–1 relevance score before surfacing in `EvidenceNode`.
+- Do not `import hybrid_retrieval` at the top of `core/rag_engine.py`. It pulls in
+  `qdrant-client` + `sentence-transformers`; keep the import lazy inside `query()` and the
+  `dense_retriever` parameter a forward-reference string annotation so the core stays stdlib-only.

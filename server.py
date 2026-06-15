@@ -38,11 +38,18 @@ app.add_middleware(
 
 # ─── Global Engine ────────────────────────────────────────────────────────────
 
+# Toggle hybrid BM25 + dense retrieval via env var so the process needs no flag.
+dense_retriever = None
+if os.getenv("BIORAG_HYBRID"):
+    from hybrid_retrieval import EmbeddingModel, DenseRetriever
+    dense_retriever = DenseRetriever(EmbeddingModel())
+
 engine = BioRAGEngine(
     chunk_size=480,
     chunk_overlap=60,
     retrieval_top_k=12,
     rerank_top_k=5,
+    dense_retriever=dense_retriever,
 )
 
 # Preload sample corpus

@@ -8,12 +8,17 @@ documents, designed as a **decision-support system** — not a simple chatbot.
 ## Architecture
 
 ```
-Query → QueryAnalyzer → InvertedIndex (BM25) → Reranker → EvidenceClassifier
-                                                              ↓
-                                               KnowledgeGapDetector
-                                                              ↓
-                                               AnswerSynthesizer → DecisionOutput
+Query → QueryAnalyzer → InvertedIndex (BM25) ─┐
+                     →  DenseRetriever (Qdrant) ┴→ RRF fusion → Reranker → EvidenceClassifier
+                       (optional, injected)                                       ↓
+                                                                   KnowledgeGapDetector
+                                                                               ↓
+                                                                   AnswerSynthesizer → DecisionOutput
 ```
+
+Dense retrieval is **optional and injected** via `BioRAGEngine(dense_retriever=...)`. With no
+dense retriever (the default) the pipeline is pure BM25 and the core engine stays stdlib-only;
+when one is supplied, BM25 and dense results are fused with Reciprocal Rank Fusion before reranking.
 
 ### Core Components
 
@@ -22,6 +27,7 @@ Query → QueryAnalyzer → InvertedIndex (BM25) → Reranker → EvidenceClassi
 | `TextProcessor` | Biomedical tokenizer with stopword filtering and abbreviation expansion (DNA, PCR, ELISA…) |
 | `DocumentChunker` | Overlapping sliding-window chunker with section detection (Abstract/Methods/Results…) |
 | `InvertedIndex` | BM25 (Okapi) inverted index — outperforms TF-IDF for biomedical text |
+| `DenseRetriever` | Optional semantic retrieval over a Qdrant collection of `S-PubMedBert` embeddings; fused with BM25 via Reciprocal Rank Fusion (`hybrid_retrieval.py`) |
 | `QueryAnalyzer` | Intent classification (mechanism/comparison/treatment/diagnosis/prognosis…) + entity extraction |
 | `Reranker` | Section-aware reranker with discriminative-token recall penalty to suppress off-topic false positives |
 | `EvidenceClassifier` | Labels each chunk as `direct`, `indirect`, or `contradictory` evidence |
@@ -50,6 +56,10 @@ pip install "mcp[cli]"
 
 # For LLM answer synthesis (ClaudeSynthesizer):
 pip install anthropic
+
+# For hybrid retrieval (BM25 + dense via Qdrant):
+pip install qdrant-client sentence-transformers
+python cli.py --hybrid --query "What plasma proteins predict Alzheimer's?"
 ```
 
 ---
@@ -88,6 +98,15 @@ python cli.py --llm --show-prompt --query "What biomarkers predict Alzheimer's d
 
 # LLM mode in interactive REPL
 python cli.py --llm --show-prompt
+
+# Hybrid retrieval: BM25 + dense (Qdrant) fused via RRF (requires: pip install qdrant-client sentence-transformers)
+python cli.py --hybrid --query "What plasma proteins predict Alzheimer's?"
+
+# Hybrid + Claude synthesis
+python cli.py --hybrid --llm --query "What plasma proteins predict Alzheimer's?"
+
+# Ingest into a hybrid index (chunks flow to both BM25 and Qdrant)
+python cli.py --hybrid --ingest "alzheimer's disease biomarkers" --ingest-max 25
 ```
 
 Inside the interactive REPL you can also ingest on the fly, with an optional paper count:
@@ -114,6 +133,10 @@ engine = BioRAGEngine(
 from llm_synthesizer import ClaudeSynthesizer
 engine = BioRAGEngine(synthesizer=ClaudeSynthesizer())
 
+# Optional: hybrid BM25 + dense retrieval (requires: pip install qdrant-client sentence-transformers)
+from hybrid_retrieval import EmbeddingModel, DenseRetriever
+engine = BioRAGEngine(dense_retriever=DenseRetriever(EmbeddingModel()))
+
 
 # Add documents
 engine.add_document(
@@ -137,6 +160,9 @@ print(f"Knowledge gaps: {result.knowledge_gaps}")
 ```bash
 python server.py
 # → http://localhost:8000
+
+# Enable hybrid BM25 + dense retrieval (no flag needed — toggled by env var)
+BIORAG_HYBRID=1 python server.py
 
 # POST /query
 curl -X POST http://localhost:8000/query \
@@ -240,7 +266,14 @@ class DecisionOutput:
 ```bash
 python tests/test_biorag.py
 # 26 tests · TextProcessor · Chunker · BM25 Index · QueryAnalyzer · EvidenceClassifier · E2E Pipeline
+
+python tests/test_hybrid_retrieval.py
+# 16 tests · EmbeddingModel · DenseRetriever · reciprocal_rank_fusion · E2E hybrid pipeline
 ```
+
+The hybrid suite uses a fake embedding model and an in-memory Qdrant collection so most tests
+stay fast and offline; only the two `EmbeddingModel` tests load the real sentence-transformers
+model (once) to verify embedding dimension and caching.
 
 ---
 
@@ -261,6 +294,9 @@ python evals/retrieval_eval.py --verbose
 
 # Custom K values
 python evals/retrieval_eval.py --ks 1 5 10
+
+# Four-mode comparison: BM25 / Dense / Hybrid (RRF) / Hybrid+Rerank
+python evals/retrieval_eval.py --hybrid --alzheimer-only --verbose
 ```
 
 Sample output:
@@ -272,6 +308,18 @@ Sample output:
   NDCG@1          0.958      0.958   +0.000
   NDCG@3          0.978      0.970   -0.008
   NDCG@5          0.985      0.970   -0.015
+```
+
+With `--hybrid`, all four retrieval modes are compared side by side so each stage's
+contribution is attributable (requires `qdrant-client` + `sentence-transformers`):
+
+```
+  Metric                BM25           Dense          Hybrid   Hybrid+Rerank
+  ──────────────────────────────────────────────────────────────────────────
+  MRR@5                0.714           0.719           0.695           0.821
+  NDCG@1               0.571           0.571           0.571           0.714
+  NDCG@3               0.752           0.733           0.714           0.804
+  NDCG@5               0.752           0.788           0.770           0.866
 ```
 
 **Metrics explained:**
@@ -356,11 +404,21 @@ both eval sets growing with the corpus.
 
 ## Key Design Decisions
 
-### Why BM25, not dense embeddings?
+### Why BM25 as the default, with dense retrieval optional?
 BM25 requires zero external dependencies and zero API calls. For domain-specific biomedical
 text with precise terminology (gene names, drug names, statistical notation), BM25 matches
-exact terms reliably. Dense embeddings offer semantic similarity but require GPU/API access
-and can hallucinate relevance for rare biomedical entities.
+exact terms reliably. Dense embeddings offer semantic similarity but pull in `torch`/`qdrant`
+and can hallucinate relevance for rare biomedical entities. So BM25 is the default and the core
+engine stays stdlib-only, while dense retrieval is an **opt-in upgrade** injected via
+`dense_retriever` — you get exact-match precision for free and semantic recall when you want it.
+
+### Why hybrid + Reciprocal Rank Fusion?
+The two retrievers fail in complementary ways: BM25 misses paraphrases ("plasma proteins" vs
+"blood biomarkers"), dense misses rare exact tokens (specific gene IDs). RRF
+(`score = Σ 1/(k + rank_i)`, `k=60`) combines them using only rank position — no score
+normalisation between incompatible scales (BM25 magnitudes vs cosine ∈ [-1, 1]). The fused
+score is written back to `RetrievedChunk.score`, so the reranker and every downstream stage are
+untouched. In the eval above, Hybrid+Rerank beats BM25 alone on every metric.
 
 ### Why explicit reasoning chains?
 Clinical decision support systems must be auditable. An opaque answer is dangerous in
@@ -392,14 +450,26 @@ stage (retrieval, reranking, classification, confidence scoring) unchanged. The 
 
 ## Extending
 
-### Adding dense retrieval (optional upgrade path)
+### Hybrid dense retrieval (shipped, opt-in)
+`hybrid_retrieval.py` provides `EmbeddingModel`, `DenseRetriever`, and `reciprocal_rank_fusion`.
+Inject a `DenseRetriever` and the engine fuses BM25 + dense results before reranking — every
+other stage (reranker, classifier, synthesizer, gap detector) is unchanged.
+
 ```python
-# Drop-in replacement for InvertedIndex.search():
-# Use sentence-transformers or OpenAI embeddings + FAISS/Qdrant
-# The rest of the pipeline (reranker, classifier, synthesizer) is embedding-agnostic
-from sentence_transformers import SentenceTransformer
-import faiss
+from hybrid_retrieval import EmbeddingModel, DenseRetriever
+from core.rag_engine import BioRAGEngine
+
+# File-based Qdrant (default): vectors persist in ./qdrant_data and survive restarts.
+# add_chunks() dedupes by chunk id, so the corpus is embedded once, not on every launch.
+engine = BioRAGEngine(dense_retriever=DenseRetriever(EmbeddingModel()))
+result = engine.query("What plasma biomarkers predict Alzheimer's disease?")
+
+# Swap the embedding model, or use an in-memory collection for tests/evals:
+dr = DenseRetriever(EmbeddingModel("BAAI/bge-small-en-v1.5"), qdrant_path=":memory:")
 ```
+
+Default model: `pritamdeka/S-PubMedBert-MS-MARCO` (768-dim, PubMed-tuned). RRF uses `k=60`;
+tune it via `reciprocal_rank_fusion(..., rrf_k=...)`.
 
 ### Using LLM answer generation
 `ClaudeSynthesizer` in `llm_synthesizer.py` is a drop-in replacement for
@@ -439,10 +509,12 @@ biorag/
 │   ├── answer_ground_truth.py # 10 AnswerClaim objects with reference claims and rubric targets
 │   └── answer_eval.py         # LLM-as-judge harness — 8-dimension rubric scored by Claude
 ├── tests/
-│   └── test_biorag.py      # 26 unit + integration tests
-├── server.py               # FastAPI REST server (includes /ingest endpoint)
-├── cli.py                  # Interactive terminal interface (--llm, --show-prompt, --save-corpus)
+│   ├── test_biorag.py            # 26 unit + integration tests
+│   └── test_hybrid_retrieval.py  # 16 tests for EmbeddingModel / DenseRetriever / RRF
+├── server.py               # FastAPI REST server (includes /ingest endpoint; BIORAG_HYBRID env var)
+├── cli.py                  # Interactive terminal interface (--llm, --show-prompt, --save-corpus, --hybrid)
 ├── llm_synthesizer.py      # ClaudeSynthesizer — LLM-backed answer synthesis, strictly grounded
+├── hybrid_retrieval.py     # EmbeddingModel + DenseRetriever (Qdrant) + reciprocal_rank_fusion
 ├── ingestion_pubmed.py     # PubMed/PMC ingestion pipeline with save_to_corpus()
 ├── mcp_server.py           # MCP server — exposes query/ingest/corpus_stats tools
 ├── requirements.txt

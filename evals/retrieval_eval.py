@@ -97,6 +97,38 @@ class EvalReport:
     by_intent: list[IntentSummary]
 
 
+# The four retrieval modes compared in --hybrid mode, in display order.
+HYBRID_MODES: list[tuple[str, str]] = [
+    ("bm25", "BM25"),
+    ("dense", "Dense"),
+    ("hybrid", "Hybrid"),
+    ("hybrid_rerank", "Hybrid+Rerank"),
+]
+
+
+@dataclass
+class HybridQueryResult:
+    """Per-query metrics for all four retrieval modes (only used with --hybrid)."""
+    query_id: str
+    query: str
+    intent: str
+    relevant_docs: dict[str, int]
+    bm25: QueryMetrics            # BM25 only
+    dense: QueryMetrics           # Qdrant cosine ANN only
+    hybrid: QueryMetrics          # BM25 + dense fused via RRF, pre-rerank
+    hybrid_rerank: QueryMetrics   # RRF fusion followed by the reranker
+
+
+@dataclass
+class HybridEvalReport:
+    """Top-level report returned by RetrievalEvaluator.evaluate_hybrid()."""
+    n_queries: int
+    ks: list[int]
+    mrr: dict[str, float]              # mode -> mean MRR@k_max across queries
+    ndcg: dict[str, dict[int, float]]  # mode -> {k -> mean NDCG@k}
+    per_query: list[HybridQueryResult]
+
+
 # ─── Metric Functions ────────────────────────────────────────────────────────
 #
 # Each function is pure: it takes a ranked doc list + the relevance dict and
@@ -282,6 +314,93 @@ class RetrievalEvaluator:
             reranked=self._compute_metrics(reranked_doc_ranking, rq.relevant_docs),
         )
 
+    # ── Hybrid (four-mode) eval ──────────────────────────────────────────────
+
+    def _dense_hits_to_doc_ranking(
+        self, dense_hits: list[tuple[str, float]]
+    ) -> list[tuple[str, float]]:
+        """Max-pool dense (chunk_id, cosine) hits to a document ranking.
+
+        Mirrors _chunks_to_doc_ranking but for the raw (chunk_id, score) tuples
+        returned by DenseRetriever.search. chunk_ids absent from the index (e.g.
+        stale vectors) are skipped.
+        """
+        doc_scores: dict[str, float] = {}
+        for chunk_id, score in dense_hits:
+            chunk = self.engine.index.chunks.get(chunk_id)
+            if chunk is None:
+                continue
+            doc_scores[chunk.doc_id] = max(doc_scores.get(chunk.doc_id, 0.0), score)
+        return sorted(doc_scores.items(), key=lambda x: x[1], reverse=True)
+
+    def evaluate_query_hybrid(self, rq: RetrievalQuery) -> HybridQueryResult:
+        """Run one query through all four modes and compute metrics for each.
+
+        Requires self.engine.dense_retriever to be set. The four modes share the
+        same BM25 candidate set and dense hits, so the comparison is apples-to-apples:
+          1. BM25 only           — InvertedIndex.search, max-pooled.
+          2. Dense only          — DenseRetriever.search, max-pooled.
+          3. Hybrid (RRF)        — reciprocal_rank_fusion of (1) and (2), max-pooled.
+          4. Hybrid + Rerank     — Reranker.rerank applied to the fused list.
+        """
+        from hybrid_retrieval import reciprocal_rank_fusion
+
+        q_analysis = self.engine.query_analyzer.analyze(rq.query)
+
+        # 1. BM25
+        bm25_chunks = self.engine.index.search(
+            q_analysis["expanded_tokens"], top_k=self._bm25_top_k
+        )
+        bm25_ranking = self._chunks_to_doc_ranking(bm25_chunks)
+
+        # 2. Dense
+        dense_hits = self.engine.dense_retriever.search(
+            rq.query, top_k=self._bm25_top_k
+        )
+        dense_ranking = self._dense_hits_to_doc_ranking(dense_hits)
+
+        # 3. Hybrid — RRF fusion (pre-rerank)
+        fused = reciprocal_rank_fusion(
+            bm25_chunks, dense_hits, self.engine.index.chunks, self._bm25_top_k
+        )
+        hybrid_ranking = self._chunks_to_doc_ranking(fused)
+
+        # 4. Hybrid + Rerank
+        reranked = self.engine.reranker.rerank(
+            fused, q_analysis, top_k=self.engine.rerank_top_k
+        )
+        hybrid_rerank_ranking = self._chunks_to_doc_ranking(reranked)
+
+        return HybridQueryResult(
+            query_id=rq.query_id,
+            query=rq.query,
+            intent=rq.intent,
+            relevant_docs=rq.relevant_docs,
+            bm25=self._compute_metrics(bm25_ranking, rq.relevant_docs),
+            dense=self._compute_metrics(dense_ranking, rq.relevant_docs),
+            hybrid=self._compute_metrics(hybrid_ranking, rq.relevant_docs),
+            hybrid_rerank=self._compute_metrics(hybrid_rerank_ranking, rq.relevant_docs),
+        )
+
+    def evaluate_hybrid(self, queries: list[RetrievalQuery]) -> HybridEvalReport:
+        """Evaluate all queries across the four retrieval modes."""
+        results = [self.evaluate_query_hybrid(q) for q in queries]
+        n = len(results)
+        mrr = {
+            mode: sum(getattr(r, mode).rr for r in results) / n
+            for mode, _ in HYBRID_MODES
+        }
+        ndcg = {
+            mode: {
+                k: sum(getattr(r, mode).ndcg[k] for r in results) / n
+                for k in self.ks
+            }
+            for mode, _ in HYBRID_MODES
+        }
+        return HybridEvalReport(
+            n_queries=n, ks=self.ks, mrr=mrr, ndcg=ndcg, per_query=results
+        )
+
     # ── Aggregation ──────────────────────────────────────────────────────────
 
     def _aggregate(self, results: list[QueryResult]) -> tuple[float, float, dict, dict]:
@@ -408,6 +527,58 @@ def print_report(report: EvalReport, verbose: bool = False) -> None:
     print(f"\n{'━' * W}\n")
 
 
+def print_hybrid_report(report: HybridEvalReport, verbose: bool = False) -> None:
+    """Print the four-mode (BM25 / Dense / Hybrid / Hybrid+Rerank) comparison."""
+    W = 78
+    bar = "─" * W
+    modes = HYBRID_MODES
+    k_max = max(report.ks)
+
+    print(f"\n{'━' * W}")
+    print(f"  BioRAG Hybrid Retrieval Eval  ({report.n_queries} queries)")
+    print(f"{'━' * W}")
+
+    # ── Summary table: metric rows × four mode columns ────────────────────────
+    header = f"  {'Metric':<10}" + "".join(f"{label:>16}" for _, label in modes)
+    print(f"\n{header}")
+    print(f"  {bar[:10 + 16 * len(modes)]}")
+
+    mrr_row = f"  {'MRR@' + str(k_max):<10}" + "".join(
+        f"{report.mrr[mode]:>16.3f}" for mode, _ in modes
+    )
+    print(mrr_row)
+
+    for k in report.ks:
+        row = f"  {'NDCG@' + str(k):<10}" + "".join(
+            f"{report.ndcg[mode][k]:>16.3f}" for mode, _ in modes
+        )
+        print(row)
+
+    # Deltas relative to the BM25 baseline make each stage's contribution visible.
+    print(f"\n  Δ vs BM25 (MRR@{k_max}):", end="  ")
+    base = report.mrr["bm25"]
+    print("  ".join(
+        f"{label} {report.mrr[mode] - base:+.3f}"
+        for mode, label in modes if mode != "bm25"
+    ))
+
+    # ── Per-query MRR@k_max across the four modes ─────────────────────────────
+    if verbose:
+        print(f"\n  {'Per-Query MRR@' + str(k_max):}")
+        print(f"  {bar}")
+        qhdr = f"  {'Query':<22}" + "".join(f"{label:>14}" for _, label in modes)
+        print(qhdr)
+        print(f"  {bar}")
+        for r in report.per_query:
+            label = f"{r.query_id} ({r.intent})"[:21]
+            row = f"  {label:<22}" + "".join(
+                f"{getattr(r, mode).rr:>14.3f}" for mode, _ in modes
+            )
+            print(row)
+
+    print(f"\n{'━' * W}\n")
+
+
 # ─── Engine builder ───────────────────────────────────────────────────────────
 
 def build_engine() -> BioRAGEngine:
@@ -418,6 +589,26 @@ def build_engine() -> BioRAGEngine:
     the reranker budget, matching production settings.
     """
     engine = BioRAGEngine(retrieval_top_k=60, rerank_top_k=5)
+    for doc in SAMPLE_DOCUMENTS:
+        engine.add_document(
+            doc["id"], doc["title"], doc["text"], doc.get("metadata", {})
+        )
+    return engine
+
+
+def build_hybrid_engine() -> BioRAGEngine:
+    """Load the sample corpus into a hybrid (BM25 + dense) BioRAGEngine.
+
+    Uses an in-memory Qdrant collection so the eval always reflects the current
+    corpus exactly (no stale vectors carried over between runs). Embedding the
+    sample corpus on each run is cheap given its size.
+    """
+    from hybrid_retrieval import EmbeddingModel, DenseRetriever
+
+    dense_retriever = DenseRetriever(EmbeddingModel(), qdrant_path=":memory:")
+    engine = BioRAGEngine(
+        retrieval_top_k=60, rerank_top_k=5, dense_retriever=dense_retriever
+    )
     for doc in SAMPLE_DOCUMENTS:
         engine.add_document(
             doc["id"], doc["title"], doc["text"], doc.get("metadata", {})
@@ -449,21 +640,29 @@ def main() -> int:
         metavar="K",
         help="K values for NDCG@K (default: 1 3 5)",
     )
+    parser.add_argument(
+        "--hybrid",
+        action="store_true",
+        help="Compare four modes: BM25 / Dense / Hybrid (RRF) / Hybrid+Rerank",
+    )
     args = parser.parse_args()
 
     queries = ALZHEIMER_QUERIES if args.alzheimer_only else EVAL_QUERIES
 
     print("Loading corpus…", end=" ", flush=True)
-    engine = build_engine()
+    engine = build_hybrid_engine() if args.hybrid else build_engine()
     stats = engine.get_corpus_stats()
     print(f"done  ({stats['documents']} docs, {stats['chunks']} chunks, {stats['unique_terms']} terms)")
 
     evaluator = RetrievalEvaluator(engine, ks=args.ks)
 
     print(f"Evaluating {len(queries)} queries…")
-    report = evaluator.evaluate(queries)
-
-    print_report(report, verbose=args.verbose)
+    if args.hybrid:
+        report = evaluator.evaluate_hybrid(queries)
+        print_hybrid_report(report, verbose=args.verbose)
+    else:
+        report = evaluator.evaluate(queries)
+        print_report(report, verbose=args.verbose)
     return 0
 
 

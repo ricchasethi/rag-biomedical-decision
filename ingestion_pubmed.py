@@ -395,6 +395,7 @@ def ingest_pubmed(
     max_results: int = 10,
     engine: BioRAGEngine | None = None,
     save_corpus: bool = False,
+    dense_retriever: "DenseRetriever | None" = None,
 ) -> IngestionResult:
     """Ingest papers for *query* into a BioRAGEngine.
 
@@ -404,7 +405,9 @@ def ingest_pubmed(
 
     If *engine* is supplied, documents are added to it directly (useful for
     the REST server or CLI where an existing corpus should be augmented).
-    Otherwise a fresh BioRAGEngine is created and returned.
+    Otherwise a fresh BioRAGEngine is created and returned.  When *engine* is
+    not supplied, *dense_retriever* (if given) is wired into the new engine so
+    ingested chunks flow to both the BM25 and dense indexes via add_document().
 
     When *save_corpus* is True, all successfully indexed papers are appended
     to data/sample_corpus.py so they persist across process restarts.
@@ -415,7 +418,7 @@ def ingest_pubmed(
     skipped (parse failures, per-PMID network errors, batch fetch errors).
     """
     if engine is None:
-        engine = BioRAGEngine()
+        engine = BioRAGEngine(dense_retriever=dense_retriever)
 
     all_errors: list[IngestionError] = []
 
@@ -506,12 +509,20 @@ if __name__ == "__main__":
                         help="Maximum number of papers to fetch (default: 5)")
     parser.add_argument("--save-corpus", action="store_true",
                         help="Append ingested papers to data/sample_corpus.py")
+    parser.add_argument("--hybrid", action="store_true",
+                        help="Enable hybrid BM25 + dense retrieval via Qdrant")
     args = parser.parse_args()
+
+    dense_retriever = None
+    if args.hybrid:
+        from hybrid_retrieval import EmbeddingModel, DenseRetriever
+        dense_retriever = DenseRetriever(EmbeddingModel())
 
     ingest_result = ingest_pubmed(
         query=args.query,
         max_results=args.max_results,
         save_corpus=args.save_corpus,
+        dense_retriever=dense_retriever,
     )
     if ingest_result.errors:
         print(f"\nSkipped {len(ingest_result.errors)} item(s):")

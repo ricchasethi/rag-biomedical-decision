@@ -143,14 +143,19 @@ def render_output(output: DecisionOutput, show_prompt: bool = False, synthesizer
 
 # ─── Engine Setup ─────────────────────────────────────────────────────────────
 
-def build_engine(use_llm: bool = False) -> BioRAGEngine:
+def build_engine(use_llm: bool = False, use_hybrid: bool = False) -> BioRAGEngine:
     print(f"{DIM}Initializing BioRAG engine...{RESET}", end=" ", flush=True)
     synthesizer = None
     if use_llm:
         from llm_synthesizer import ClaudeSynthesizer
         synthesizer = ClaudeSynthesizer()
         print(f"{DIM}(LLM synthesizer: {ClaudeSynthesizer.MODEL}){RESET}", end=" ", flush=True)
-    engine = BioRAGEngine(synthesizer=synthesizer)
+    dense_retriever = None
+    if use_hybrid:
+        from hybrid_retrieval import EmbeddingModel, DenseRetriever
+        dense_retriever = DenseRetriever(EmbeddingModel())
+        print(f"{DIM}(hybrid: {EmbeddingModel.DEFAULT_MODEL}){RESET}", end=" ", flush=True)
+    engine = BioRAGEngine(synthesizer=synthesizer, dense_retriever=dense_retriever)
     total_chunks = 0
     for doc in SAMPLE_DOCUMENTS:
         n = engine.add_document(doc["id"], doc["title"], doc["text"], doc.get("metadata"))
@@ -277,9 +282,13 @@ def main():
         "--show-prompt", action="store_true",
         help="Print the LLM prompt before each answer (only meaningful with --llm)",
     )
+    parser.add_argument(
+        "--hybrid", action="store_true",
+        help="Enable hybrid BM25 + dense retrieval via Qdrant",
+    )
     args = parser.parse_args()
 
-    engine = build_engine(use_llm=args.llm)
+    engine = build_engine(use_llm=args.llm, use_hybrid=args.hybrid)
 
     if args.ingest:
         print(f"{DIM}Fetching {args.ingest_max} papers from PubMed/PMC: {args.ingest}{RESET}")

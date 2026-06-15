@@ -21,13 +21,14 @@ uvicorn[standard]>=0.24.0      # ASGI server with websockets + HTTP/2 support
 pydantic>=2.0.0                # Request/response validation (FastAPI dependency)
 
 
-# ── Optional: Dense Retrieval Upgrade ────────────────────────
-# Drop-in semantic search to replace or augment BM25.
-# Uncomment if you want embedding-based retrieval.
+# ── Optional: Hybrid Dense Retrieval (hybrid_retrieval.py) ────
+# Semantic search via Qdrant, fused with BM25 through RRF.
+# Required only when running with the --hybrid flag / BIORAG_HYBRID=1.
 
-sentence-transformers>=2.3.0   # Local embedding models (e.g. all-MiniLM-L6-v2)
-faiss-cpu>=1.7.4               # Vector index (CPU build; use faiss-gpu for GPU)
-numpy>=1.26.0                  # Required by faiss and sentence-transformers
+sentence-transformers>=2.3.0   # Local embedding models (default: pritamdeka/S-PubMedBert-MS-MARCO)
+qdrant-client>=1.18.0          # Vector store + cosine ANN (in-memory, file-based, or server)
+faiss-cpu>=1.7.4               # Alternative vector index (CPU build; use faiss-gpu for GPU)
+numpy>=1.26.0                  # Required by qdrant-client, faiss, and sentence-transformers
 
 
 # ── Optional: LLM Answer Generation ─────────────────────────

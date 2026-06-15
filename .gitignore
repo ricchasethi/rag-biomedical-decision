@@ -1,0 +1,19 @@
+# ─── Hybrid retrieval (Qdrant) ───────────────────────────────
+# File-based vector store created on the first --hybrid / BIORAG_HYBRID run.
+qdrant_data/
+
+# ─── Python ──────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ─── Virtual environments ────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ─── Local env / secrets ─────────────────────────────────────
+.env

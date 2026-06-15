@@ -1010,6 +1010,7 @@ class BioRAGEngine:
         retrieval_top_k: int = 15,
         rerank_top_k: int = 5,
         synthesizer: AnswerSynthesizer | None = None,
+        dense_retriever: "DenseRetriever | None" = None,
     ):
         self.chunker = DocumentChunker(chunk_size, chunk_overlap)
         self.index = InvertedIndex()
@@ -1019,6 +1020,7 @@ class BioRAGEngine:
         self.gap_detector = KnowledgeGapDetector()
         self.synthesizer = synthesizer if synthesizer is not None else AnswerSynthesizer()
         self.followup_gen = FollowUpGenerator()
+        self.dense_retriever = dense_retriever
 
         self.retrieval_top_k = retrieval_top_k
         self.rerank_top_k = rerank_top_k
@@ -1032,6 +1034,9 @@ class BioRAGEngine:
             chunks = self.chunker.chunk_document(doc_id, title, text)
             for chunk in chunks:
                 self.index.add_chunk(chunk)
+
+            if self.dense_retriever:
+                self.dense_retriever.add_chunks(chunks)
 
             self.documents[doc_id] = {
                 "id": doc_id,
@@ -1055,6 +1060,16 @@ class BioRAGEngine:
                 q_analysis["expanded_tokens"],
                 top_k=self.retrieval_top_k,
             )
+            if self.dense_retriever:
+                # Lazy import keeps core/rag_engine.py stdlib-only.
+                from hybrid_retrieval import reciprocal_rank_fusion
+                dense_hits = self.dense_retriever.search(
+                    question, top_k=self.retrieval_top_k
+                )
+                raw_results = reciprocal_rank_fusion(
+                    raw_results, dense_hits,
+                    self.index.chunks, self.retrieval_top_k,
+                )
 
             # 3. Rerank
             reranked = self.reranker.rerank(raw_results, q_analysis, top_k=self.rerank_top_k)
