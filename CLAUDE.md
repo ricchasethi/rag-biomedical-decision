@@ -51,6 +51,10 @@ python cli.py --ingest "alzheimer's disease biomarkers" --ingest-max 25 --save-c
 # Ingest into a hybrid index (chunks flow to both BM25 and Qdrant)
 python cli.py --hybrid --ingest "alzheimer's disease biomarkers" --ingest-max 25
 
+# Cross-encoder reranking: final semantic ranking stage (requires: pip install sentence-transformers)
+python cli.py --rerank --query "What plasma proteins predict Alzheimer's?"
+python cli.py --hybrid --rerank --query "What biomarkers predict CVD risk in T2DM?"
+
 # Run the ingestion script standalone (supports --query, --max-results, --save-corpus, --hybrid)
 python ingestion_pubmed.py --query "alzheimer's disease biomarkers" --max-results 10 --save-corpus
 
@@ -61,8 +65,14 @@ python evals/retrieval_eval.py --alzheimer-only --verbose
 # Four-mode retrieval eval: BM25 / Dense / Hybrid (RRF) / Hybrid+Rerank
 python evals/retrieval_eval.py --hybrid --alzheimer-only --verbose
 
+# Add a fifth column comparing the cross-encoder final ranking (implies --hybrid)
+python evals/retrieval_eval.py --cross-encoder --alzheimer-only
+
 # Run hybrid retrieval tests
 python tests/test_hybrid_retrieval.py
+
+# Run cross-encoder reranker tests
+python tests/test_cross_encoder_rerank.py
 
 # Start API server (requires: pip install fastapi uvicorn pydantic)
 python server.py
@@ -70,6 +80,10 @@ python server.py
 
 # Start API server with hybrid retrieval enabled
 BIORAG_HYBRID=1 python server.py
+
+# Start API server with cross-encoder reranking (combine with BIORAG_HYBRID for the full pipeline)
+BIORAG_RERANK=1 python server.py
+BIORAG_HYBRID=1 BIORAG_RERANK=1 python server.py
 
 # Start MCP server standalone (requires: pip install "mcp[cli]")
 python mcp_server.py
@@ -92,6 +106,8 @@ BioRAGEngine.query(question)
   ├─ DenseRetriever.search()          → Qdrant cosine ANN top-K  ┐  (only when
   ├─ reciprocal_rank_fusion()         → fuse BM25 + dense via RRF ┘   dense_retriever set)
   ├─ Reranker.rerank()                → section-aware score adjustment + discriminative-token recall penalty
+  │                                     (becomes a pre-filter to cross_encoder_candidates when cross_encoder set)
+  ├─ CrossEncoderReranker.rerank()    → semantic (query,chunk) scoring, final top-K  (only when cross_encoder set)
   ├─ EvidenceClassifier.classify()    → direct / indirect / contradictory
   ├─ KnowledgeGapDetector.detect()    → missing data, contradictions, low relevance
   ├─ AnswerSynthesizer.synthesize()   → answer text + reasoning chain + confidence
@@ -430,6 +446,89 @@ collection's lifetime, not on every launch.
 
 ---
 
+## Cross-Encoder Reranking
+
+`cross_encoder_rerank.py` adds a **true semantic reranker** as the final ranking stage.
+Where the lexical `Reranker` (in `core/rag_engine.py`) only scores term overlap, section
+weights, and discriminative-token recall, a cross-encoder feeds the query and chunk text
+through a transformer *together* and emits one calibrated relevance score per pair —
+modelling paraphrase, negation, and entity disambiguation that BM25 cannot see.
+
+Like `DenseRetriever` and `ClaudeSynthesizer`, it is **optional and injected** via
+`BioRAGEngine(cross_encoder=...)`; `core/rag_engine.py` stays stdlib-only and never imports
+the module except in spirit (the type is a forward-reference string annotation).
+
+```python
+from cross_encoder_rerank import CrossEncoderReranker
+from core.rag_engine import BioRAGEngine
+
+engine = BioRAGEngine(cross_encoder=CrossEncoderReranker())
+result = engine.query("What plasma biomarkers predict Alzheimer's?")
+
+# Combine with hybrid retrieval for the full pipeline
+from hybrid_retrieval import EmbeddingModel, DenseRetriever
+engine = BioRAGEngine(
+    dense_retriever=DenseRetriever(EmbeddingModel()),
+    cross_encoder=CrossEncoderReranker(),
+)
+```
+
+### Two-stage reranking: lexical pre-filter → cross-encoder
+
+When a `cross_encoder` is set, the pipeline becomes:
+
+```
+BM25 → dense → RRF → Reranker (pre-filter, top cross_encoder_candidates) → CrossEncoderReranker (final top rerank_top_k)
+```
+
+The lexical `Reranker` is **not discarded** — it stays upstream as a cheap pre-filter that
+narrows the candidate set to `cross_encoder_candidates` (default 12) before the more
+expensive cross-encoder runs. This bounds cross-encoder cost while letting the
+discriminative-token penalty drop obvious off-topic chunks first. The cross-encoder then
+produces the final `rerank_top_k` ranking.
+
+### How it stays transparent to the rest of the pipeline
+
+`CrossEncoderReranker.rerank()` writes a **sigmoid-mapped score in (0, 1)** to
+`RetrievedChunk.score`. The existing 0–1 normalisation in `query()` handles it, so
+`EvidenceNode.relevance_score`, the classifier, gaps, and synthesizer are all unchanged.
+`match_terms` is carried over from the candidate. The knowledge-gap detector still uses the
+raw BM25/RRF `all_results` for its IDF-based low-score threshold, so it is unaffected.
+
+### Components
+
+| Component | Role |
+|---|---|
+| `CrossEncoderReranker` | Wraps sentence-transformers `CrossEncoder`. Lazy-loads on first `rerank()`; caches pair scores by an MD5 of `query + chunk_text`. Default model: `cross-encoder/ms-marco-MiniLM-L-6-v2`. |
+
+### Wiring across entry points
+
+| Entry point | How to enable |
+|---|---|
+| `cli.py` | `--rerank` flag (combine with `--hybrid`) |
+| `server.py` | `BIORAG_RERANK=1` env var (combine with `BIORAG_HYBRID=1`) |
+| `evals/retrieval_eval.py` | `--cross-encoder` flag → adds a fifth `Hybrid+CE` column (implies `--hybrid`) |
+
+### Tuning
+
+- **`cross_encoder_candidates`** (default 12): the pre-filter budget. Raise it to give the
+  cross-encoder more candidates (better recall, higher latency); lower it to cut cost.
+- **Model**: pass a different name to `CrossEncoderReranker(model_name=...)`. For tighter
+  biomedical fit, try a PubMedBERT cross-encoder such as `ncbi/MedCPT-Cross-Encoder` at the
+  cost of a larger download.
+
+### What the eval reveals
+
+On the current 4-document sample corpus, the four-mode `--cross-encoder` eval shows
+`Hybrid+CE` improving MRR@5 over BM25 (+0.02–0.05) but **trailing the hand-tuned lexical
+`Hybrid+Rerank`**. This is expected and honest: with only 4 documents and document-level
+max-pooling there is little to reorder, and `Reranker.SECTION_WEIGHTS` is tuned on exactly
+these queries. A cross-encoder's advantage grows with corpus size/diversity and at the chunk
+level, and a biomedical cross-encoder would likely close the gap. Re-run the eval after
+ingesting a larger corpus before drawing conclusions.
+
+---
+
 ## Adding a New Document to the Corpus
 
 ```python
@@ -555,3 +654,6 @@ tests load the real sentence-transformers model (once, to check dimension and ca
 - Do not `import hybrid_retrieval` at the top of `core/rag_engine.py`. It pulls in
   `qdrant-client` + `sentence-transformers`; keep the import lazy inside `query()` and the
   `dense_retriever` parameter a forward-reference string annotation so the core stays stdlib-only.
+- Likewise do not `import cross_encoder_rerank` in `core/rag_engine.py`. It pulls in
+  `sentence-transformers`; the `cross_encoder` parameter is a forward-reference string
+  annotation and the injected object's `.rerank()` is called directly — no import needed.

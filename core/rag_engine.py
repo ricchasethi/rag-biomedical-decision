@@ -1009,8 +1009,10 @@ class BioRAGEngine:
         chunk_overlap: int = 64,
         retrieval_top_k: int = 15,
         rerank_top_k: int = 5,
+        cross_encoder_candidates: int = 12,
         synthesizer: AnswerSynthesizer | None = None,
         dense_retriever: "DenseRetriever | None" = None,
+        cross_encoder: "CrossEncoderReranker | None" = None,
     ):
         self.chunker = DocumentChunker(chunk_size, chunk_overlap)
         self.index = InvertedIndex()
@@ -1021,9 +1023,14 @@ class BioRAGEngine:
         self.synthesizer = synthesizer if synthesizer is not None else AnswerSynthesizer()
         self.followup_gen = FollowUpGenerator()
         self.dense_retriever = dense_retriever
+        self.cross_encoder = cross_encoder
 
         self.retrieval_top_k = retrieval_top_k
         self.rerank_top_k = rerank_top_k
+        # When a cross-encoder is injected, the lexical Reranker becomes a cheap
+        # pre-filter that narrows the candidate set to this many chunks before the
+        # (more expensive) cross-encoder produces the final top rerank_top_k ranking.
+        self.cross_encoder_candidates = cross_encoder_candidates
 
         self.documents: dict[str, dict] = {}  # doc_id -> metadata
         self._lock = threading.Lock()  # serialises concurrent add_document / query
@@ -1036,7 +1043,7 @@ class BioRAGEngine:
                 self.index.add_chunk(chunk)
 
             if self.dense_retriever:
-                self.dense_retriever.add_chunks(chunks)
+                self.dense_retriever.add_chunks(chunks, metadata or {})
 
             self.documents[doc_id] = {
                 "id": doc_id,
@@ -1072,7 +1079,20 @@ class BioRAGEngine:
                 )
 
             # 3. Rerank
-            reranked = self.reranker.rerank(raw_results, q_analysis, top_k=self.rerank_top_k)
+            if self.cross_encoder:
+                # Lexical reranker is a cheap pre-filter; the cross-encoder does
+                # the final semantic ranking over the narrowed candidate set.
+                # Lazy import keeps core/rag_engine.py stdlib-only.
+                candidates = self.reranker.rerank(
+                    raw_results, q_analysis, top_k=self.cross_encoder_candidates
+                )
+                reranked = self.cross_encoder.rerank(
+                    question, candidates, top_k=self.rerank_top_k
+                )
+            else:
+                reranked = self.reranker.rerank(
+                    raw_results, q_analysis, top_k=self.rerank_top_k
+                )
 
             # 4. Build evidence nodes
             evidence_nodes: list[EvidenceNode] = []

@@ -15,6 +15,7 @@ Three components:
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import uuid
 
@@ -113,14 +114,19 @@ class DenseRetriever:
         """Deterministic UUID for a chunk id — lets us dedupe on re-index."""
         return str(uuid.uuid5(uuid.NAMESPACE_DNS, chunk_id))
 
-    def add_chunks(self, chunks: list[Chunk]) -> None:
+    def add_chunks(self, chunks: list[Chunk], doc_metadata: dict | None = None) -> None:
         """Embed and upsert chunks, skipping any already stored in Qdrant.
 
         On every engine launch ``BioRAGEngine`` re-adds the sample corpus; this guard
         asks Qdrant which point IDs already exist (IDs only, no vectors fetched) and
         embeds only the genuinely new chunks, so the embedding model is hit once per
         chunk over the collection's lifetime.
+
+        ``doc_metadata`` is the document-level metadata dict from ``add_document``
+        (source, has_full_text, year, journal, etc.) — stored in each point's payload
+        so the index is queryable by corpus origin and ingest date.
         """
+        meta = doc_metadata or {}
         if not chunks:
             return
 
@@ -142,11 +148,21 @@ class DenseRetriever:
             return  # all chunks already in Qdrant — nothing to embed
 
         vectors = self.model.encode([c.text for c in new_chunks])
+        today = datetime.date.today().isoformat()
         points = [
             PointStruct(
                 id=self._point_id(c.id),
                 vector=vec,
-                payload={"chunk_id": c.id, "doc_id": c.doc_id, "section": c.section},
+                payload={
+                    "chunk_id":      c.id,
+                    "doc_id":        c.doc_id,
+                    "section":       c.section,
+                    "source":        meta.get("source", "sample_corpus"),
+                    "ingest_date":   today,
+                    "has_full_text": meta.get("has_full_text", False),
+                    "year":          meta.get("year"),
+                    "journal":       meta.get("journal"),
+                },
             )
             for c, vec in zip(new_chunks, vectors)
         ]
