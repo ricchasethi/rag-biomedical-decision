@@ -1,0 +1,10 @@
+# CPU-only torch. Without the +cpu pin and the extra index, sentence-transformers
+# drags in the CUDA build and the image goes from ~2.5 GB to ~8 GB.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.9.1+cpu
+
+sentence-transformers==5.4.1
+qdrant-client==1.19.0          # matches the Airflow 3.3.1 constraint set
+psycopg2-binary==2.9.12
+pypdf==6.16.2
+requests>=2.32

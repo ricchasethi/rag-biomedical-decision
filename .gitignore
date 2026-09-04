@@ -17,3 +17,9 @@ env/
 
 # ─── Local env / secrets ─────────────────────────────────────
 .env
+
+# ─── Airflow / pipeline runtime ──────────────────────────────
+airflow/logs/
+airflow/.env
+airflow/config/
+var/

@@ -1,0 +1,52 @@
+# Additions to the vendored docker-compose.yaml. Compose merges this on top:
+# `environment` maps merge key-by-key, `volumes`/`ports` lists append.
+
+x-biorag-common: &biorag-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: biorag/airflow:3.3.1
+  environment:
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    # The pipeline package lives in the repo, mounted at /opt/biorag.
+    PYTHONPATH: /opt/biorag
+    BIORAG_DB_URL: postgresql+psycopg2://airflow:airflow@postgres:5432/biorag
+    BIORAG_QDRANT_URL: http://qdrant:6333
+    BIORAG_RAW_DIR: /opt/biorag/var/raw
+    BIORAG_REPORT_DIR: /opt/biorag/var/reports
+    BIORAG_EMBED_MODEL: pritamdeka/S-PubMedBert-MS-MARCO
+    HF_HOME: /opt/biorag/var/hf_cache   # model downloads persist on the host
+    TOKENIZERS_PARALLELISM: 'false'     # silences the fork warning under Celery
+  volumes:
+    - ../:/opt/biorag
+
+services:
+  postgres:
+    volumes:
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+
+  qdrant:
+    image: qdrant/qdrant:v1.19.0
+    container_name: biorag-qdrant
+    ports:
+      - "6333:6333"   # REST + dashboard
+      - "6334:6334"   # gRPC
+    volumes:
+      - qdrant-storage:/qdrant/storage
+    restart: always
+
+  airflow-apiserver:     *biorag-common
+  airflow-scheduler:     *biorag-common
+  airflow-dag-processor: *biorag-common
+  airflow-triggerer:     *biorag-common
+  airflow-init:          *biorag-common
+  airflow-cli:           *biorag-common
+
+  airflow-worker:
+    <<: *biorag-common
+    depends_on:
+      qdrant:
+        condition: service_started
+
+volumes:
+  qdrant-storage:
