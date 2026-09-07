@@ -2973,20 +2973,6 @@ SAMPLE_DOCUMENTS = [
     },
 
     {
-        "id": 'pmid_42317338',
-        "title": 'Efficacy and mechanisms of immune checkpoint inhibitors in late-stage EGFR-mutated non-small cell lung cancer following targeted therapy resistance.',
-        "text": 'Abstract\nCurrently, epidermal growth factor receptor-tyrosine kinase inhibitors (EGFR-TKIs) represent the standard first-line treatment for advanced EGFR-mutated non-small cell lung cancer (NSCLC). However, as the disease progresses, targeted resistance inevitably develops. Chemoimmunotherapy, as the standard treatment for advanced NSCLC without driver gene mutations, has significantly improved patient survival. EGFR-mutant tumors exhibit unique immunogenicity compared to wild-type tumors, with heterogeneity in programmed death ligand 1(PD-L1) expression levels, tumor mutational burden (TMB), and other immune microenvironment characteristics. Therefore, we elucidate the mechanisms of immune resistance in EGFR-mutant patients and analyze the core immune mechanisms underlying EGFR-TKI resistance. We summarize the application of immune checkpoint inhibitors (ICIs) in advanced EGFR-mutant NSCLC and analyze the associated mechanisms of action.',
-        "metadata": {
-            "year": '2026',
-            "journal": 'Frontiers in immunology',
-            "source": 'pubmed',
-            "pmcid": '',
-            "pmid": '42317338',
-            "has_full_text": False,
-        },
-    },
-
-    {
         "id": 'pmid_42185471',
         "title": 'Optimal treatment strategies for EGFR mutant advanced lung adenocarcinoma patients with targeted therapy resistance and correlation analysis of PD-L1 expression with ICI efficacy.',
         "text": 'Abstract\nThird-generation tyrosine kinase inhibitors (TKIs) have become the standard treatment for advanced epidermal growth factor receptor (EGFR)-mutated lung adenocarcinoma. Currently, after developing resistance to third-generation EGFR-TKIs, treatment regimens based on platinum-based dual-agent chemotherapy yield limited clinical benefit. This retrospective study analyzed patients who progressed on first-line third-generation EGFR-TKIs between March 2019 and September 2024 and received second-line chemotherapy-based regimens. Patients were further stratified based on PD-L1 expression status and immune checkpoint inhibitor (ICI) use to assess the correlation between PD-L1 expression and ICI efficacy. Among 107 patients who progressed on third-generation TKIs as first-line therapy, 35 received chemotherapy (C), 29 received chemotherapy combined with anti-angiogenic (C\u2009+\u2009A), 22 received chemoimmunotherapy (C\u2009+\u2009I), and 21 received chemoimmunotherapy combined with anti-angiogenic therapy (C\u2009+\u2009I\u2009+\u2009A). Second-line median progression-free survival (mPFS2) were 4.89\xa0months, 6.74\xa0months, 7.80\xa0months, and 8.00\xa0months, respectively. Non-ICIs group vs. ICIs group: mPFS2 was 5.06\xa0months vs. 8.00\xa0months, P\u2009=\u20090.031. In PD-L1-negative, positive, and strong subgroups, the Non-ICIs group vs. ICIs group showed mPFS2 of 5.32 months vs. 6.68 months, P\u2009=\u20090.724; 4.89 months vs. 8.63 months, P\u2009=\u20090.009, and 3.11 months vs. 13.52 months, P\u2009<\u20090.001. Among patients with EGFR-TKI resistance, combination immunochemotherapy with or without anti-angiogenic therapy demonstrates distinct advantages over chemotherapy alone. Adding ICIs in PD-L1-positive patients improves progression-free survival, with greater clinical benefit observed at higher PD-L1 expression levels. Within the immunotherapy cohort, PD-L1-high patients show a trend toward more pronounced benefit from ICIs.',

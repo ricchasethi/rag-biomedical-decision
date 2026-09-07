@@ -61,6 +61,22 @@ def make_chunks(n: int) -> list[ChunkRecord]:
     ]
 
 
+def pending_queue(conn) -> list[dict]:
+    """The unembedded chunks belonging to this test's paper.
+
+    repo.pending_chunks() is a corpus-wide queue by design - the embedder wants
+    every unembedded chunk, not one paper's. Asserting on its raw length only
+    holds against an empty database, so the smoke test scopes it to TEST_ID and
+    stays correct on a database that already holds real papers.
+
+    The limit is raised well past the default for the same reason: the LIMIT is
+    applied before this filter, so a small one could truncate the result before
+    the test's own rows appear.
+    """
+    return [c for c in repo.pending_chunks(conn, limit=100_000)
+            if c["arxiv_id"] == TEST_ID]
+
+
 def cleanup(conn) -> None:
     with conn.cursor() as cur:
         cur.execute("DELETE FROM ingest_errors WHERE run_id = %s", (TEST_RUN,))
@@ -117,19 +133,19 @@ def main() -> int:
               repo.get_paper(conn, TEST_ID)["n_chunks"] == 3)
         repo.replace_chunks(conn, TEST_ID, make_chunks(3))
         check("re-write leaves 3 rows, not 6",
-              len(repo.pending_chunks(conn)) == 3)
+              len(pending_queue(conn)) == 3)
         check("shrinking to 2 drops the third",
               repo.replace_chunks(conn, TEST_ID, make_chunks(2)) == 2)
         check("pending reflects the shrink",
-              len(repo.pending_chunks(conn)) == 2)
+              len(pending_queue(conn)) == 2)
 
         print("\n-- chunks: embedding queue --")
-        pending = repo.pending_chunks(conn)
+        pending = pending_queue(conn)
         check("join exposes doc_title", pending[0]["doc_title"].startswith("Synthetic"))
         check("join exposes doc_id", pending[0]["doc_id"] == f"arxiv_{TEST_ID}")
         check("marking one embedded returns 1",
               repo.mark_chunks_embedded(conn, [pending[0]["chunk_id"]]) == 1)
-        check("queue shrinks to 1", len(repo.pending_chunks(conn)) == 1)
+        check("queue shrinks to 1", len(pending_queue(conn)) == 1)
         check("empty list is safe", repo.mark_chunks_embedded(conn, []) == 0)
 
         print("\n-- runs and errors --")

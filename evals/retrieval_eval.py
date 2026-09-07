@@ -105,10 +105,18 @@ HYBRID_MODES: list[tuple[str, str]] = [
     ("hybrid_rerank", "Hybrid+Rerank"),
 ]
 
+# Fifth mode, appended only when a cross-encoder is attached (--cross-encoder):
+# RRF fusion → lexical pre-filter → cross-encoder final ranking.
+CROSS_ENCODER_MODE: tuple[str, str] = ("hybrid_rerank_ce", "Hybrid+CE")
+
 
 @dataclass
 class HybridQueryResult:
-    """Per-query metrics for all four retrieval modes (only used with --hybrid)."""
+    """Per-query metrics for each retrieval mode (only used with --hybrid).
+
+    ``hybrid_rerank_ce`` is populated only when the engine has a cross-encoder
+    attached; otherwise it stays None and the CE column is omitted from the report.
+    """
     query_id: str
     query: str
     intent: str
@@ -116,7 +124,8 @@ class HybridQueryResult:
     bm25: QueryMetrics            # BM25 only
     dense: QueryMetrics           # Qdrant cosine ANN only
     hybrid: QueryMetrics          # BM25 + dense fused via RRF, pre-rerank
-    hybrid_rerank: QueryMetrics   # RRF fusion followed by the reranker
+    hybrid_rerank: QueryMetrics   # RRF fusion followed by the lexical reranker
+    hybrid_rerank_ce: QueryMetrics | None = None  # + cross-encoder final ranking
 
 
 @dataclass
@@ -124,6 +133,7 @@ class HybridEvalReport:
     """Top-level report returned by RetrievalEvaluator.evaluate_hybrid()."""
     n_queries: int
     ks: list[int]
+    modes: list[tuple[str, str]]       # (attr, label) pairs actually evaluated
     mrr: dict[str, float]              # mode -> mean MRR@k_max across queries
     ndcg: dict[str, dict[int, float]]  # mode -> {k -> mean NDCG@k}
     per_query: list[HybridQueryResult]
@@ -365,11 +375,25 @@ class RetrievalEvaluator:
         )
         hybrid_ranking = self._chunks_to_doc_ranking(fused)
 
-        # 4. Hybrid + Rerank
+        # 4. Hybrid + Rerank (lexical reranker)
         reranked = self.engine.reranker.rerank(
             fused, q_analysis, top_k=self.engine.rerank_top_k
         )
         hybrid_rerank_ranking = self._chunks_to_doc_ranking(reranked)
+
+        # 5. Hybrid + Cross-Encoder (optional) — mirrors the engine's CE pipeline:
+        #    lexical reranker pre-filters to cross_encoder_candidates, then the
+        #    cross-encoder produces the final top rerank_top_k ranking.
+        hybrid_rerank_ce_metrics = None
+        if self.engine.cross_encoder is not None:
+            candidates = self.engine.reranker.rerank(
+                fused, q_analysis, top_k=self.engine.cross_encoder_candidates
+            )
+            ce_reranked = self.engine.cross_encoder.rerank(
+                rq.query, candidates, top_k=self.engine.rerank_top_k
+            )
+            ce_ranking = self._chunks_to_doc_ranking(ce_reranked)
+            hybrid_rerank_ce_metrics = self._compute_metrics(ce_ranking, rq.relevant_docs)
 
         return HybridQueryResult(
             query_id=rq.query_id,
@@ -380,25 +404,29 @@ class RetrievalEvaluator:
             dense=self._compute_metrics(dense_ranking, rq.relevant_docs),
             hybrid=self._compute_metrics(hybrid_ranking, rq.relevant_docs),
             hybrid_rerank=self._compute_metrics(hybrid_rerank_ranking, rq.relevant_docs),
+            hybrid_rerank_ce=hybrid_rerank_ce_metrics,
         )
 
     def evaluate_hybrid(self, queries: list[RetrievalQuery]) -> HybridEvalReport:
-        """Evaluate all queries across the four retrieval modes."""
+        """Evaluate all queries across the hybrid modes (+ cross-encoder if present)."""
         results = [self.evaluate_query_hybrid(q) for q in queries]
         n = len(results)
+        modes = list(HYBRID_MODES)
+        if self.engine.cross_encoder is not None:
+            modes.append(CROSS_ENCODER_MODE)
         mrr = {
             mode: sum(getattr(r, mode).rr for r in results) / n
-            for mode, _ in HYBRID_MODES
+            for mode, _ in modes
         }
         ndcg = {
             mode: {
                 k: sum(getattr(r, mode).ndcg[k] for r in results) / n
                 for k in self.ks
             }
-            for mode, _ in HYBRID_MODES
+            for mode, _ in modes
         }
         return HybridEvalReport(
-            n_queries=n, ks=self.ks, mrr=mrr, ndcg=ndcg, per_query=results
+            n_queries=n, ks=self.ks, modes=modes, mrr=mrr, ndcg=ndcg, per_query=results
         )
 
     # ── Aggregation ──────────────────────────────────────────────────────────
@@ -528,11 +556,11 @@ def print_report(report: EvalReport, verbose: bool = False) -> None:
 
 
 def print_hybrid_report(report: HybridEvalReport, verbose: bool = False) -> None:
-    """Print the four-mode (BM25 / Dense / Hybrid / Hybrid+Rerank) comparison."""
-    W = 78
-    bar = "─" * W
-    modes = HYBRID_MODES
+    """Print the multi-mode (BM25 / Dense / Hybrid / Hybrid+Rerank [/ +CE]) comparison."""
+    modes = report.modes
     k_max = max(report.ks)
+    W = max(78, 12 + 16 * len(modes))
+    bar = "─" * W
 
     print(f"\n{'━' * W}")
     print(f"  BioRAG Hybrid Retrieval Eval  ({report.n_queries} queries)")
@@ -596,18 +624,27 @@ def build_engine() -> BioRAGEngine:
     return engine
 
 
-def build_hybrid_engine() -> BioRAGEngine:
+def build_hybrid_engine(cross_encoder: bool = False) -> BioRAGEngine:
     """Load the sample corpus into a hybrid (BM25 + dense) BioRAGEngine.
 
     Uses an in-memory Qdrant collection so the eval always reflects the current
     corpus exactly (no stale vectors carried over between runs). Embedding the
     sample corpus on each run is cheap given its size.
+
+    When ``cross_encoder`` is True, also attaches a CrossEncoderReranker so the
+    eval can compare the lexical reranker against the cross-encoder final stage.
     """
     from hybrid_retrieval import EmbeddingModel, DenseRetriever
 
+    ce = None
+    if cross_encoder:
+        from cross_encoder_rerank import CrossEncoderReranker
+        ce = CrossEncoderReranker()
+
     dense_retriever = DenseRetriever(EmbeddingModel(), qdrant_path=":memory:")
     engine = BioRAGEngine(
-        retrieval_top_k=60, rerank_top_k=5, dense_retriever=dense_retriever
+        retrieval_top_k=60, rerank_top_k=5,
+        dense_retriever=dense_retriever, cross_encoder=ce,
     )
     for doc in SAMPLE_DOCUMENTS:
         engine.add_document(
@@ -645,19 +682,30 @@ def main() -> int:
         action="store_true",
         help="Compare four modes: BM25 / Dense / Hybrid (RRF) / Hybrid+Rerank",
     )
+    parser.add_argument(
+        "--cross-encoder",
+        action="store_true",
+        help="Add a cross-encoder final-ranking column (Hybrid+CE); implies --hybrid",
+    )
     args = parser.parse_args()
+
+    # The cross-encoder column is shown inside the hybrid four-mode table.
+    use_hybrid = args.hybrid or args.cross_encoder
 
     queries = ALZHEIMER_QUERIES if args.alzheimer_only else EVAL_QUERIES
 
     print("Loading corpus…", end=" ", flush=True)
-    engine = build_hybrid_engine() if args.hybrid else build_engine()
+    engine = (
+        build_hybrid_engine(cross_encoder=args.cross_encoder)
+        if use_hybrid else build_engine()
+    )
     stats = engine.get_corpus_stats()
     print(f"done  ({stats['documents']} docs, {stats['chunks']} chunks, {stats['unique_terms']} terms)")
 
     evaluator = RetrievalEvaluator(engine, ks=args.ks)
 
     print(f"Evaluating {len(queries)} queries…")
-    if args.hybrid:
+    if use_hybrid:
         report = evaluator.evaluate_hybrid(queries)
         print_hybrid_report(report, verbose=args.verbose)
     else:
