@@ -3,6 +3,11 @@
 A production-grade **Retrieval-Augmented Generation** engine for scientific and biomedical
 documents, designed as a **decision-support system** — not a simple chatbot.
 
+The engine is paired with a scheduled ingestion pipeline: an **Airflow 3 DAG over Postgres and
+Qdrant** that discovers, fetches, parses, chunks and embeds papers unattended, with resumable
+state and per-paper failure isolation. See
+[Automated Ingestion Pipeline](#automated-ingestion-pipeline-airflow--postgres--qdrant).
+
 ---
 
 ## Architecture
@@ -60,6 +65,9 @@ pip install anthropic
 # For hybrid retrieval (BM25 + dense via Qdrant):
 pip install qdrant-client sentence-transformers
 python cli.py --hybrid --query "What plasma proteins predict Alzheimer's?"
+
+# For the scheduled arXiv ingestion pipeline (Airflow + Postgres + Qdrant):
+cd airflow && docker compose up -d      # nothing to pip install on the host
 ```
 
 ---
@@ -236,6 +244,154 @@ persist for the lifetime of the server process.
 
 ---
 
+## Automated Ingestion Pipeline (Airflow + Postgres + Qdrant)
+
+There are two ways papers enter BioRAG, and they are deliberately different:
+
+| | On-demand ingestion | Scheduled pipeline |
+|---|---|---|
+| Entry point | `ingestion_pubmed.py`, `cli.py --ingest`, `POST /ingest` | `airflow/dags/arxiv_ingest_daily.py` |
+| Source | PubMed / PMC | arXiv |
+| State | In-memory (plus optional `--save-corpus`) | Postgres + Qdrant, durable |
+| Scale | Tens of papers, interactive | Thousands, unattended, resumable |
+
+Everything above this section describes the first. This section describes the second:
+`biorag_pipeline/` (the stages) and `airflow/` (the infrastructure that schedules them).
+
+### The stack
+
+`docker compose` brings up Airflow 3 (apiserver, scheduler, worker, dag-processor, triggerer),
+Postgres hosting **two** databases — Airflow's own and `biorag` — plus Redis and a Qdrant server.
+
+```bash
+cd airflow
+echo "AIRFLOW_UID=$(id -u)" >> .env   # see airflow/README.md §1.7 for the full file
+docker compose build          # CPU-only torch: ~4.8 GB, not ~9 GB
+docker compose up -d
+
+# Airflow UI  → http://localhost:8080   (airflow / airflow)
+# Qdrant UI   → http://localhost:6333/dashboard
+
+# The DAG registers paused, as Airflow does by default — unpause it to schedule,
+# or leave it paused and trigger manually.
+docker compose exec airflow-worker airflow dags unpause arxiv_ingest_daily
+docker compose exec airflow-worker airflow dags trigger arxiv_ingest_daily
+```
+
+`airflow/README.md` has the full build from scratch in twelve steps, ending in four
+verification checks. The repository is mounted at `/opt/biorag` inside every container, so
+edits take effect without a rebuild.
+
+### The DAG
+
+```
+migrate → discover → fetch → parse (dynamically mapped) → chunk → embed → finish
+```
+
+Scheduled `0 6 * * *`, `catchup=False`, `max_active_runs=1`, two retries per task.
+
+| Stage | Module | Reads | Writes | Status transition |
+|---|---|---|---|---|
+| `migrate` | `migrate.py` | `migrations/*.sql` | `schema_migrations` | — |
+| `discover` | `discover.py` | arXiv Atom API | `papers`, `ingest_runs` | → `discovered` |
+| `fetch` | `fetch.py` | `papers` | `var/raw/*.pdf` | `discovered` → `fetched` |
+| `parse` | `parse.py` | PDFs | `var/raw/*.txt` | `fetched` → `parsed` |
+| `chunk` | `chunk.py` | `.txt` files | `chunks` | `parsed` → `chunked` |
+| `embed` | `embed.py` | `chunks` | Qdrant collection | `chunked` → `indexed` |
+| `finish` | — | `ingest_runs` | `ingest_runs` | — |
+
+**Runtime parameters** (editable when triggering from the UI):
+
+| Param | Default | Meaning |
+|---|---|---|
+| `categories` | `q-bio.QM,q-bio.GN,q-bio.NC` | Comma-separated arXiv categories; empty means all of arXiv |
+| `search` | *(empty)* | Optional topic phrase, AND-ed with the categories |
+| `lookback_days` | `2` | Submission window width — wider than a day because arXiv's index lags |
+| `max_results` | `50` | Cap on papers per run |
+
+### Running any stage standalone
+
+Every module is also a CLI, so the whole pipeline is developable with Airflow stopped:
+
+```bash
+docker compose exec airflow-worker bash -lc 'cd /opt/biorag && ...'
+
+python -m biorag_pipeline.migrate --status
+python -m biorag_pipeline.discover --days 3 --max-results 10 --dry-run
+python -m biorag_pipeline.discover --search "protein folding" --field ti --any-category
+python -m biorag_pipeline.fetch    --limit 5
+python -m biorag_pipeline.parse    --limit 10 --show
+python -m biorag_pipeline.chunk    --limit 10 --show
+python -m biorag_pipeline.embed    --limit 500
+python -m biorag_pipeline.embed    --stats
+python -m biorag_pipeline.embed    --search "protein structure prediction"
+```
+
+Each accepts `--arxiv-id` (repeatable) to process specific papers instead of the pending queue.
+
+### Data model
+
+Four tables in the `biorag` database, plus `schema_migrations`:
+
+| Table | Purpose |
+|---|---|
+| `papers` | One row per arXiv paper. `arxiv_id` is the **natural** primary key, so "have I seen this paper?" is a uniqueness constraint enforced by Postgres rather than application logic that can drift |
+| `chunks` | Mirrors `core.rag_engine.Chunk` minus `tokens` — those are a pure function of `TextProcessor.tokenize()` and would go stale the moment `clean_text()` changes |
+| `ingest_runs` | One row per DAG run, with counters |
+| `ingest_errors` | Per-paper, per-stage failures recorded as **data**, never raised — one bad PDF must not fail a run of five hundred |
+
+Paper lifecycle:
+
+```
+discovered → fetched → parsed → chunked → indexed
+                  ↘ failed     ↘ skipped
+```
+
+`chunks_pending_idx` is a **partial** index on unembedded rows only, so the embedding work
+queue stays small no matter how large the corpus grows.
+
+### Why it survives failure
+
+- **No stage takes its work list from the previous stage's XCom.** Each queries Postgres by
+  status, so a run that dies mid-way resumes from the database rather than needing a list from
+  a task that already failed.
+- **Postgres is the source of truth for what *should* exist; `chunks.embedded` tracks what
+  *does*.** Papers are promoted to `indexed` by a database predicate, not by the embedding job
+  believing it succeeded — which is what makes a half-finished embedding run resumable without
+  re-encoding anything.
+- **Transient and permanent failures are distinguished.** A fetch timeout leaves the paper at
+  `discovered` for tomorrow's run; a 404 marks it `failed` so it is not retried forever.
+- **Deterministic IDs make re-indexing idempotent.** Chunk IDs are `md5(doc_id:char_offset)[:12]`
+  and Qdrant point IDs are `uuid5(chunk_id)`, so re-chunking identical text overwrites in place
+  instead of duplicating.
+- **`finish` uses `trigger_rule="all_done"`** and reads counters from the database, because
+  XComs vanish precisely when the run summary matters most.
+
+### Configuration
+
+Every setting is an environment variable with a host-friendly default (`biorag_pipeline/config.py`):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `BIORAG_DB_URL` | `postgresql://airflow:airflow@localhost:5432/biorag` | Pipeline database |
+| `BIORAG_QDRANT_URL` | `http://localhost:6333` | Qdrant server |
+| `BIORAG_QDRANT_COLLECTION` | `biorag_chunks` | Collection name |
+| `BIORAG_EMBED_MODEL` | `pritamdeka/S-PubMedBert-MS-MARCO` | Embedding model (dimension is probed, not hardcoded) |
+| `BIORAG_RAW_DIR` | `./var/raw` | Downloaded PDFs and extracted text |
+| `BIORAG_ARXIV_CATEGORIES` | `q-bio.QM,q-bio.GN,q-bio.NC` | Default categories |
+| `BIORAG_ARXIV_MAX_RESULTS` | `50` | Default per-run cap |
+| `BIORAG_CHUNK_SIZE` / `BIORAG_CHUNK_OVERLAP` | `512` / `64` | Mirrors the `BioRAGEngine` defaults |
+
+### Migrations
+
+Plain `.sql` files in `biorag_pipeline/migrations/`, applied in filename order, each in its own
+transaction and recorded in `schema_migrations` — so re-running is a no-op and `migrate` can be
+the first task of every DAG run. Deliberately not Alembic: Airflow already runs its own Alembic
+instance against the `airflow` database, and a second migration framework buys nothing for a
+four-table schema.
+
+---
+
 ## DecisionOutput Structure
 
 ```python
@@ -269,11 +425,27 @@ python tests/test_biorag.py
 
 python tests/test_hybrid_retrieval.py
 # 16 tests · EmbeddingModel · DenseRetriever · reciprocal_rank_fusion · E2E hybrid pipeline
+
+python tests/test_cross_encoder_rerank.py
+# 13 tests · CrossEncoderReranker scoring, caching, engine integration
+
+# Pipeline suites — need psycopg2 and a live biorag database, so run them in the worker:
+docker compose exec airflow-worker python /opt/biorag/tests/test_arxiv_client.py
+# 32 checks · arXiv id parsing · Atom feed parsing · query grammar · date windows
+
+docker compose exec airflow-worker python /opt/biorag/tests/test_pipeline_db.py
+# 28 checks · upsert + versioning · status transitions · chunk replace · embed queue
 ```
+
+115 checks across five suites, all passing.
 
 The hybrid suite uses a fake embedding model and an in-memory Qdrant collection so most tests
 stay fast and offline; only the two `EmbeddingModel` tests load the real sentence-transformers
 model (once) to verify embedding dimension and caching.
+
+`test_pipeline_db.py` runs against the live `biorag` database and cleans up after itself: it
+writes under a reserved `arxiv_id` (`0000.99999`) and scopes every assertion to it, so it is
+safe to run against a database that already holds real papers.
 
 ---
 
@@ -505,16 +677,45 @@ biorag/
 │   └── sample_corpus.py    # Biomedical corpus sourced from PubMed Central (citation-cleaned)
 ├── evals/
 │   ├── ground_truth.py        # 16 RetrievalQuery objects with doc-level relevance grades (0/1/2)
-│   ├── retrieval_eval.py      # MRR and NDCG@K harness — evaluates BM25 vs reranker separately
+│   ├── retrieval_eval.py      # MRR and NDCG@K harness — up to 5 retrieval modes side by side
 │   ├── answer_ground_truth.py # 10 AnswerClaim objects with reference claims and rubric targets
-│   └── answer_eval.py         # LLM-as-judge harness — 8-dimension rubric scored by Claude
+│   ├── answer_eval.py         # LLM-as-judge harness — 8-dimension rubric scored by Claude
+│   └── ragas_answer_eval.py   # Same rubric via RAGAS metrics, for cross-validation
 ├── tests/
-│   ├── test_biorag.py            # 26 unit + integration tests
-│   └── test_hybrid_retrieval.py  # 16 tests for EmbeddingModel / DenseRetriever / RRF
+│   ├── test_biorag.py               # 26 unit + integration tests
+│   ├── test_hybrid_retrieval.py     # 16 tests for EmbeddingModel / DenseRetriever / RRF
+│   ├── test_cross_encoder_rerank.py # 13 tests for the cross-encoder stage
+│   ├── test_arxiv_client.py         # 32 checks — id/feed parsing, query grammar, windows
+│   └── test_pipeline_db.py          # 28 checks — repository round-trip against live Postgres
+│
+├── biorag_pipeline/        # ── Scheduled ingestion: one module per DAG stage ──
+│   ├── config.py           # Environment-driven settings (BIORAG_* vars)
+│   ├── db.py               # psycopg2 connection handling — no ORM
+│   ├── migrate.py          # Applies migrations/*.sql, recorded in schema_migrations
+│   ├── repository.py       # All SQL. Knows nothing about core.rag_engine
+│   ├── arxiv_client.py     # arXiv Atom API: query grammar, throttle, paging, id parsing
+│   ├── discover.py         # Stage 1 — search arXiv, upsert papers
+│   ├── fetch.py            # Stage 2 — download PDFs atomically into var/raw/
+│   ├── parse.py            # Stage 3 — pypdf extraction, section normalisation, sanitisation
+│   ├── chunk.py            # Stage 4 — reuses DocumentChunker, writes the chunks table
+│   ├── embed.py            # Stage 5 — QdrantIndexer, batched encode + upsert
+│   └── migrations/         # 001_initial.sql, 002_add_chunked_status.sql
+├── airflow/                # ── Infrastructure ──
+│   ├── dags/
+│   │   └── arxiv_ingest_daily.py  # The DAG — thin wrappers over biorag_pipeline/
+│   ├── docker-compose.yaml        # Vendored official Airflow 3 compose file
+│   ├── docker-compose.override.yml# Qdrant, the biorag DB, BIORAG_* env, repo mount
+│   ├── Dockerfile                 # Airflow + CPU-only torch + pipeline deps
+│   ├── initdb/                    # Creates the biorag database beside airflow's
+│   └── README.md                  # Full 12-step infrastructure build + verification
+├── var/                    # Runtime artifacts (gitignored): raw/ PDFs and extracted text
+│
 ├── server.py               # FastAPI REST server (includes /ingest endpoint; BIORAG_HYBRID env var)
 ├── cli.py                  # Interactive terminal interface (--llm, --show-prompt, --save-corpus, --hybrid)
 ├── llm_synthesizer.py      # ClaudeSynthesizer — LLM-backed answer synthesis, strictly grounded
 ├── hybrid_retrieval.py     # EmbeddingModel + DenseRetriever (Qdrant) + reciprocal_rank_fusion
+├── cross_encoder_rerank.py # CrossEncoderReranker — final semantic ranking stage
+├── rerankers.py            # Lexical / bi-encoder / cross-encoder behind one interface
 ├── ingestion_pubmed.py     # PubMed/PMC ingestion pipeline with save_to_corpus()
 ├── mcp_server.py           # MCP server — exposes query/ingest/corpus_stats tools
 ├── requirements.txt

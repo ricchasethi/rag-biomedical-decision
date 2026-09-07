@@ -90,13 +90,29 @@ python mcp_server.py
 
 # Register MCP server with Claude Code (run once)
 claude mcp add biorag python /absolute/path/to/mcp_server.py
+
+# --- Scheduled arXiv ingestion pipeline (Airflow + Postgres + Qdrant) ---
+# Bring up the stack (Airflow UI on :8080, Qdrant on :6333)
+cd airflow && docker compose up -d
+
+# Any stage standalone, inside the worker (repo is mounted at /opt/biorag)
+docker compose exec airflow-worker bash -lc 'cd /opt/biorag && python -m biorag_pipeline.embed --stats'
+
+# Pipeline test suites (need psycopg2 + a live biorag database)
+docker compose exec airflow-worker python /opt/biorag/tests/test_arxiv_client.py
+docker compose exec airflow-worker python /opt/biorag/tests/test_pipeline_db.py
 ```
 
 ---
 
 ## Architecture
 
-The pipeline runs in this order. Each stage is a separate class in `core/rag_engine.py`:
+> "Pipeline" means two things in this repo. This section and **Modifying the Pipeline** describe
+> the **query** pipeline inside `core/rag_engine.py`. The **ingestion** pipeline — the scheduled
+> arXiv DAG — is a separate system documented under
+> [Scheduled Ingestion Pipeline](#scheduled-ingestion-pipeline-biorag_pipeline--airflow).
+
+The query pipeline runs in this order. Each stage is a separate class in `core/rag_engine.py`:
 
 ```
 BioRAGEngine.query(question)
@@ -639,6 +655,191 @@ Hybrid retrieval has its own suite, `tests/test_hybrid_retrieval.py` (run with
 in-memory Qdrant collection so most tests stay fast and offline; only the two `EmbeddingModel`
 tests load the real sentence-transformers model (once, to check dimension and caching).
 
+The cross-encoder stage has `tests/test_cross_encoder_rerank.py` (13 checks). The ingestion
+pipeline has two more suites that need `psycopg2` and, for one of them, a live database — see
+**Pipeline tests** below. Five suites, 115 checks in total.
+
+---
+
+## Scheduled Ingestion Pipeline (`biorag_pipeline/` + `airflow/`)
+
+A second, independent ingestion path from `ingestion_pubmed.py`. That one is in-process,
+in-memory and PubMed-facing; this one is scheduled, durable and arXiv-facing, backed by
+Postgres for state and a Qdrant **server** for vectors.
+
+```
+migrate → discover → fetch → parse (dynamically mapped) → chunk → embed → finish
+```
+
+### The seam that must not be crossed
+
+This is the single most important convention in the pipeline:
+
+- `biorag_pipeline/repository.py` knows nothing about `core.rag_engine`.
+- `core/rag_engine.py` knows nothing about Postgres.
+- The conversion between the engine's `Chunk` and the repository's `ChunkRecord` happens in
+  `biorag_pipeline/chunk.py` **and nowhere else**.
+
+Either side can be replaced without touching the other. Do not import `repository` into the
+engine, and do not import engine internals into `repository`.
+
+### Running the pipeline
+
+The repo is mounted at `/opt/biorag` in every container, so edits take effect with no rebuild.
+
+```bash
+cd airflow
+docker compose up -d
+docker compose ps                       # all services healthy
+docker compose logs -f airflow-worker
+
+# Every stage is a standalone CLI — develop with Airflow stopped
+docker compose exec airflow-worker bash -lc 'cd /opt/biorag && python -m biorag_pipeline.migrate --status'
+
+python -m biorag_pipeline.discover --days 3 --max-results 10 --dry-run
+python -m biorag_pipeline.discover --search "protein folding" --field ti --any-category
+python -m biorag_pipeline.fetch    --limit 5
+python -m biorag_pipeline.parse    --limit 10 --show      # section breakdown + text preview
+python -m biorag_pipeline.chunk    --limit 10 --show      # per-section chunk counts
+python -m biorag_pipeline.embed    --limit 500
+python -m biorag_pipeline.embed    --stats                # Postgres vs Qdrant counts
+python -m biorag_pipeline.embed    --search "QUERY"       # sanity-check the vector index
+
+# The DAG registers paused by default
+docker compose exec airflow-worker airflow dags list
+docker compose exec airflow-worker airflow dags unpause arxiv_ingest_daily
+docker compose exec airflow-worker airflow dags trigger arxiv_ingest_daily
+```
+
+Every stage accepts `--arxiv-id` (repeatable) to process specific papers rather than the
+pending queue, and `--run-id` to attribute errors to a run.
+
+### Stage responsibilities
+
+| Stage | Module | Reads | Writes | Status transition |
+|---|---|---|---|---|
+| `migrate` | `migrate.py` | `migrations/*.sql` | `schema_migrations` | — |
+| `discover` | `discover.py` | arXiv Atom API | `papers`, `ingest_runs` | → `discovered` |
+| `fetch` | `fetch.py` | `papers` | `var/raw/*.pdf` | `discovered` → `fetched` |
+| `parse` | `parse.py` | PDFs | `var/raw/*.txt` | `fetched` → `parsed` |
+| `chunk` | `chunk.py` | `.txt` files | `chunks` | `parsed` → `chunked` |
+| `embed` | `embed.py` | `chunks` | Qdrant | `chunked` → `indexed` |
+| `finish` | DAG-local | `ingest_runs` | `ingest_runs` | — |
+
+### Invariants to preserve when editing
+
+- **Status is the work queue.** No stage takes its work list from the previous stage's XCom —
+  each queries Postgres by status. Keep it that way: it is what makes a half-failed run
+  resumable. Never pass a list of ids between tasks.
+- **Postgres says what *should* exist; `chunks.embedded` says what *does*.** Papers reach
+  `indexed` via `repo.promote_indexed()` — a database predicate — not because `embed_pending()`
+  believes it succeeded. Do not shortcut this.
+- **One bad paper must never fail the batch.** Failures are recorded as data in
+  `ingest_errors` and the paper is marked `failed`; exceptions are for programmer errors only.
+  This mirrors the engine rule about not raising on low-quality results.
+- **Network calls never happen inside a database transaction.** `discover` opens a connection
+  to record the run, closes it, searches arXiv, then opens a second connection for the writes.
+  A minute-long transaction blocks vacuum and risks idle-in-transaction timeouts.
+- **IDs are deterministic.** Chunk ids are `md5(doc_id:char_offset)[:12]`; Qdrant point ids are
+  `uuid5(NAMESPACE_DNS, chunk_id)`. Re-processing identical text overwrites in place. Do not
+  introduce random or sequential ids.
+- **`sanitize_text()` runs on both write and read.** A single NUL byte from a PDF makes
+  Postgres reject an entire batch insert. `chunk.py` re-sanitises on read because `.txt` files
+  written before the parser learned to strip control characters still contain them.
+- **Heavy imports live inside task bodies**, never at DAG module level. The dag-processor
+  re-imports the DAG file every few seconds; importing torch there would make every parse cycle
+  take seconds.
+- **`fetch` is deliberately not dynamically mapped.** The arXiv throttle is process-local, so
+  parallel mapped instances would each start their own timer and hammer the API. `parse` *is*
+  mapped, in batches of `PARSE_BATCH_SIZE = 5`, because pypdf extraction is CPU-bound with no
+  external rate limit.
+
+### Database schema
+
+Four tables plus `schema_migrations`. `papers.arxiv_id` is the **natural** primary key, which
+is what makes ingestion idempotent — "have I seen this paper?" is a uniqueness constraint
+enforced by Postgres, not application logic that can drift.
+
+```
+discovered → fetched → parsed → chunked → indexed
+                  ↘ failed     ↘ skipped
+```
+
+`chunks` mirrors `core.rag_engine.Chunk` **minus `tokens`** — those are a pure function of
+`TextProcessor.tokenize()` and would go stale the next time `clean_text()` changes. Store the
+count only. `chunks_pending_idx` is a partial index on unembedded rows, so the embedding queue
+stays small regardless of corpus size.
+
+### Adding a migration
+
+Add a numbered `.sql` file to `biorag_pipeline/migrations/`. They are applied in filename
+order, each in its own transaction, recorded in `schema_migrations` — so re-running is a no-op
+and `migrate` is safe as the first task of every DAG run. Write them re-runnably
+(`DROP CONSTRAINT IF EXISTS` before `ADD CONSTRAINT`), since an earlier attempt may have got
+part-way. Do not reach for Alembic: Airflow already runs its own Alembic instance against the
+`airflow` database, and a second framework buys nothing for a four-table schema.
+
+### Adding a pipeline stage
+
+1. Write `biorag_pipeline/<stage>.py` exposing `<stage>_pending(run_id, limit, ...) -> <Stage>Result`,
+   with an `argparse` CLI under `if __name__ == "__main__"`.
+2. Add any new status value to the `papers_status_check` constraint via a migration.
+3. Add a thin `@task` wrapper to the DAG that calls it and returns a small dict of counters.
+4. Query Postgres by status inside the stage — never accept a work list as an argument
+   (`--arxiv-id` for manual runs is the exception).
+
+### Configuration
+
+All settings come from the environment via `biorag_pipeline/config.py`, with host-friendly
+defaults so the same code runs inside Airflow or from a shell. Container values are set in
+`airflow/docker-compose.override.yml`.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `BIORAG_DB_URL` | `postgresql://airflow:airflow@localhost:5432/biorag` | Pipeline database |
+| `BIORAG_QDRANT_URL` | `http://localhost:6333` | Qdrant server |
+| `BIORAG_QDRANT_COLLECTION` | `biorag_chunks` | Collection name |
+| `BIORAG_EMBED_MODEL` | `pritamdeka/S-PubMedBert-MS-MARCO` | Embedding model |
+| `BIORAG_RAW_DIR` | `./var/raw` | PDFs and extracted text |
+| `BIORAG_ARXIV_CATEGORIES` | `q-bio.QM,q-bio.GN,q-bio.NC` | Default categories |
+| `BIORAG_ARXIV_MAX_RESULTS` | `50` | Per-run cap |
+| `BIORAG_CHUNK_SIZE` / `BIORAG_CHUNK_OVERLAP` | `512` / `64` | Mirrors `BioRAGEngine` defaults |
+
+`BIORAG_DB_URL` is written in SQLAlchemy form (`postgresql+psycopg2://`) so the same variable
+can drive SQLAlchemy later; `db.dsn()` strips the `+driver` suffix, which libpq rejects.
+
+Changing `BIORAG_EMBED_MODEL` to a different dimension requires a **new collection** — Qdrant
+vector dimensions are immutable. `QdrantIndexer.ensure_collection()` probes the dimension from
+the model rather than hardcoding it, so only the collection name needs to change.
+
+### Pipeline tests
+
+```bash
+docker compose exec airflow-worker python /opt/biorag/tests/test_arxiv_client.py   # 32 checks, offline
+docker compose exec airflow-worker python /opt/biorag/tests/test_pipeline_db.py    # 28 checks, live DB
+```
+
+`test_arxiv_client.py` is offline — it parses fixture XML. `test_pipeline_db.py` runs against
+the live `biorag` database under a reserved id (`0000.99999`) and cleans up after itself.
+
+Its `pending_queue()` helper exists for a reason: `repo.pending_chunks()` is a **corpus-wide**
+queue by design, so asserting on its raw length only holds against an empty database. Scope
+new assertions to `TEST_ID` the same way, or the suite will pass locally and fail on any
+database holding real papers.
+
+### What not to do here
+
+- Do not import `hybrid_retrieval` or `cross_encoder_rerank` into `biorag_pipeline/repository.py`
+  or `db.py` — the storage layer stays free of ML dependencies.
+- Do not add an ORM. The schema is four tables and the queries are simple; an ORM would only
+  add a dependency that has to stay compatible with whatever Airflow pins.
+- Do not put pipeline logic in the DAG file. Every task is a wrapper that calls one function in
+  `biorag_pipeline/` and returns a small dict — that is what keeps the pipeline testable from a
+  shell with Airflow stopped, and keeps DAG parsing fast.
+- Do not remove the `+cpu` torch pin in `airflow/Dockerfile`. Without it, sentence-transformers
+  drags in the CUDA build and the image goes from ~4.8 GB to ~9 GB.
+- Do not commit `airflow/.env`, `airflow/logs/`, or `var/` — all gitignored runtime state.
+
 ---
 
 ## What Not to Do
@@ -654,6 +855,8 @@ tests load the real sentence-transformers model (once, to check dimension and ca
 - Do not `import hybrid_retrieval` at the top of `core/rag_engine.py`. It pulls in
   `qdrant-client` + `sentence-transformers`; keep the import lazy inside `query()` and the
   `dense_retriever` parameter a forward-reference string annotation so the core stays stdlib-only.
+- Do not import `biorag_pipeline` (or psycopg2) into `core/rag_engine.py`. The engine must not
+  know that Postgres exists; the pipeline depends on the engine, never the reverse.
 - Likewise do not `import cross_encoder_rerank` in `core/rag_engine.py`. It pulls in
   `sentence-transformers`; the `cross_encoder` parameter is a forward-reference string
   annotation and the injected object's `.rerank()` is called directly — no import needed.
