@@ -20,7 +20,8 @@ from psycopg2.extensions import connection as PGConnection
 
 UpsertResult = Literal["inserted", "updated", "unchanged"]
 Stage = Literal["discover", "fetch", "parse", "chunk", "embed", "report", "cleanup"]
-PaperStatus = Literal["discovered", "fetched", "parsed", "indexed", "failed", "skipped"]
+PaperStatus = Literal["discovered", "fetched", "parsed", "chunked",
+                      "indexed", "failed", "skipped"]
 
 
 # --- Records ----------------------------------------------------------------
@@ -275,6 +276,39 @@ def mark_chunks_embedded(conn: PGConnection, chunk_ids: list[str]) -> int:
         return cur.rowcount
 
 
+def count_chunks(conn: PGConnection, arxiv_id: str) -> int:
+    """Total chunks stored for a paper, embedded or not.
+
+    The embedder compares this against how many of the paper's chunks are pending.
+    When they are equal the chunk set was just rewritten, so its stale Qdrant
+    points must be dropped before the new ones go in.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM chunks WHERE arxiv_id = %s", (arxiv_id,))
+        return cur.fetchone()[0]
+
+
+def promote_indexed(conn: PGConnection) -> int:
+    """Advance every fully-embedded 'chunked' paper to 'indexed'.
+
+    A paper is only indexed once *all* of its chunks are confirmed in Qdrant, so a
+    partial embedding run leaves it at 'chunked' and the next run finishes the job.
+    Returns the number of papers promoted.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE papers p
+               SET status = 'indexed', indexed_at = now()
+             WHERE p.status = 'chunked'
+               AND EXISTS (SELECT 1 FROM chunks c WHERE c.arxiv_id = p.arxiv_id)
+               AND NOT EXISTS (SELECT 1 FROM chunks c
+                                WHERE c.arxiv_id = p.arxiv_id AND NOT c.embedded)
+            """
+        )
+        return cur.rowcount
+
+
 # --- Runs and errors --------------------------------------------------------
 
 def start_run(
@@ -356,6 +390,41 @@ def record_error(
             """,
             (run_id, arxiv_id, stage, reason[:4000]),
         )
+
+
+def run_summary(conn: PGConnection, run_id: str) -> dict[str, Any]:
+    """Counters for one run, derived entirely from the database.
+
+    The DAG's final task uses this instead of collecting XComs from the upstream
+    stages. XComs vanish when a task fails, which is exactly when the summary
+    matters most; the database still holds the truth either way. It also keeps the
+    same numbers available to anyone querying Postgres directly.
+    """
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT
+              (SELECT count(*) FROM papers
+                WHERE first_run_id = r.run_id)                     AS n_discovered,
+              (SELECT count(*) FROM papers
+                WHERE status = 'fetched' OR raw_path IS NOT NULL
+                  AND discovered_at >= r.started_at)               AS n_fetched,
+              (SELECT count(*) FROM papers
+                WHERE status = 'indexed'
+                  AND indexed_at >= r.started_at)                  AS n_indexed,
+              (SELECT count(*) FROM chunks c JOIN papers p USING (arxiv_id)
+                WHERE p.indexed_at >= r.started_at)                AS n_chunks,
+              (SELECT count(*) FROM chunks c JOIN papers p USING (arxiv_id)
+                WHERE c.embedded AND p.indexed_at >= r.started_at) AS n_embedded,
+              (SELECT count(*) FROM ingest_errors
+                WHERE run_id = r.run_id)                           AS n_failed
+            FROM ingest_runs r
+            WHERE r.run_id = %s
+            """,
+            (run_id,),
+        )
+        row = cur.fetchone()
+    return dict(row) if row else {}
 
 
 def corpus_stats(conn: PGConnection) -> dict[str, Any]:

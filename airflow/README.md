@@ -594,6 +594,112 @@ docker compose down -v  # ALSO delete Postgres + Qdrant data (destructive)
 
 ---
 
+## Tuning and open questions
+
+Every value below is an environment variable in `docker-compose.override.yml`, so
+changing one needs a `docker compose up -d` and a re-run - never a code change.
+Nothing here is a bug; they are decisions worth revisiting once the pipeline is
+stable, ideally measured rather than guessed.
+
+### 1. `BIORAG_CHUNK_SIZE` is in **characters**, not tokens (open)
+
+**Current:** `512` chars, giving ~428-char chunks averaging **54 tokens** and
+**113 chunks per paper**.
+
+`DocumentChunker` measures in characters (`core/rag_engine.py`, `sent_len = len(sent)`),
+but almost every RAG guide quotes chunk sizes in *tokens*, where 512 is a common
+default. The coincidence makes `chunk_size=512` look conventional while actually
+being about a quarter of the usual size.
+
+| | Current | Typical RAG |
+|---|---|---|
+| Chunk size | 428 chars ~ **54 tokens** | 1,000-2,000 chars ~ 250-500 tokens |
+| Chunks per paper | **113** | 25-50 |
+| Embedding context used | **~11%** of PubMedBERT's 512-token window | 50-100% |
+
+**Why the default was fine and no longer is.** `BioRAGEngine(chunk_size=512)` was
+chosen when the corpus was four hand-written documents in `data/sample_corpus.py`,
+each a few thousand characters. A full arXiv PDF is ~51,000 characters - a 10-25x
+jump the default was never sized for.
+
+**What it costs:** 4x the vectors (6,654 chunks ~ 20 MB today; ~350 MB at 1,000
+papers), 4x the embedding time, and thin context per hit - a retrieved chunk is
+often a single sentence with unresolved pronouns. Against that, small chunks give
+sharper lexical precision, which is part of why the BM25 path scores well.
+
+**To change:**
+
+```yaml
+# docker-compose.override.yml, under x-biorag-common -> environment
+    BIORAG_CHUNK_SIZE: '1800'
+    BIORAG_CHUNK_OVERLAP: '200'
+```
+
+```bash
+docker compose up -d
+docker compose exec postgres psql -U airflow -d biorag -c \
+  "UPDATE papers SET status='parsed' WHERE status IN ('chunked','indexed');"
+docker compose exec airflow-worker python -m biorag_pipeline.chunk --limit 500
+docker compose exec airflow-worker python -m biorag_pipeline.embed --limit 20000
+```
+
+Re-chunking needs **no re-download and no re-parse** - the extracted text is
+already on disk. That is what the three-tier storage split was for.
+
+> **Measure, do not guess.** `evals/retrieval_eval.py` reports MRR and NDCG@K and
+> is exactly the instrument for this. Run it at 512, run it at 1800, compare.
+> Changing chunk size on intuition is how RAG systems quietly get worse.
+
+### 2. `BIORAG_EMBED_MODEL` is PubMed-tuned, the corpus is arXiv (open)
+
+**Current:** `pritamdeka/S-PubMedBert-MS-MARCO`, 768-dim, trained on PubMed.
+
+A good fit while ingesting `q-bio.*`. If the corpus drifts toward `cs.LG` /
+`stat.ML` - which happens easily, since many q-bio papers are cross-listed and
+`--any-category` topic searches ignore categories entirely - a general model such
+as `BAAI/bge-base-en-v1.5` would likely retrieve better.
+
+Changing the model changes the vector dimension, so it needs a **new collection**,
+not just a re-embed:
+
+```yaml
+    BIORAG_EMBED_MODEL: 'BAAI/bge-base-en-v1.5'
+    BIORAG_QDRANT_COLLECTION: 'biorag_chunks_bge'
+```
+```bash
+docker compose exec postgres psql -U airflow -d biorag -c \
+  "UPDATE chunks SET embedded = FALSE;"
+docker compose exec airflow-worker python -m biorag_pipeline.embed --limit 20000
+```
+
+Keeping the old collection means you can A/B the two with the same eval harness.
+
+### 3. Reference lists are dropped at parse time (deliberate, revisit if needed)
+
+`parse.py` truncates each document at its References heading. Bibliographies are
+roughly a third of a paper and are pure lexical noise under BM25 - author names
+and title fragments that match almost any query while answering none.
+
+`--keep-references` disables it per run. If citation-graph features are ever
+wanted, this is the decision to revisit, and it would want its own table rather
+than being folded back into chunk text.
+
+### 4. `lookback_days` defaults to 2, not 1 (deliberate)
+
+arXiv's search index lags announcement, so a strict 24-hour window silently drops
+papers. The overlap is free: `upsert_paper()` returns `unchanged` and writes
+nothing for anything already stored. Widen it further if a run ever reports fewer
+papers than arXiv's listing page shows.
+
+### 5. Fetch is not parallelised (deliberate)
+
+The 3-second arXiv throttle in `fetch.py` is **process-local**, so mapping the
+fetch task would give each mapped instance its own timer and defeat the rate
+limit. One task, one throttle. For bulk historical ingestion use arXiv's S3 bulk
+access rather than raising this ceiling.
+
+---
+
 ## Where the build has got to
 
 | Step | Status | Delivers |

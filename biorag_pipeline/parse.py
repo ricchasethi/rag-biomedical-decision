@@ -91,6 +91,25 @@ _ARXIV_STAMP = re.compile(r"arXiv:\d{4}\.\d{4,5}v\d+\s*\[[\w.\-]+\]\s*\d+\s+\w+\
 _PAGE_NUMBER = re.compile(r"^\s*(?:page\s+)?\d{1,4}\s*(?:of\s+\d{1,4})?\s*$", re.I)
 
 
+# Control characters that PDF extraction emits but text can never legitimately
+# contain. Tab (09), newline (0a) and carriage return (0d) are deliberately kept.
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def sanitize_text(text: str) -> str:
+    """Remove control characters that would poison downstream storage.
+
+    NUL (0x00) is the one that actually breaks things: a Postgres text column
+    cannot hold it, and psycopg2 raises ValueError before the statement is even
+    sent - so a single such byte fails an entire batch insert. pypdf produces them
+    for certain embedded font encodings, so this is data, not a bug.
+
+    Applied before hashing, so content_hash describes the text that is actually
+    stored rather than the raw extraction.
+    """
+    return _CONTROL_CHARS.sub("", text)
+
+
 @dataclass
 class ParsedDocument:
     """Extracted text plus what the pipeline needs to decide whether to re-index."""
@@ -202,7 +221,7 @@ def parse_pdf(path: Path, drop_references: bool = True) -> ParsedDocument:
     pages = [(page.extract_text() or "") for page in reader.pages]
     pages = _drop_running_heads(pages)
 
-    raw = "\n".join(pages)
+    raw = sanitize_text("\n".join(pages))
     text, sections = normalise_sections(raw, drop_references)
 
     # Collapse runs of blank lines but keep single newlines: clean_text() in the
@@ -225,7 +244,7 @@ def from_abstract(title: str, abstract: str) -> ParsedDocument:
     Mirrors ingestion_pubmed.py's abstract-only path: a scanned or image-only PDF
     still contributes a searchable record rather than being dropped.
     """
-    text = f"{title}\nAbstract.\n{abstract}".strip()
+    text = sanitize_text(f"{title}\nAbstract.\n{abstract}".strip())
     return ParsedDocument(
         text=text,
         content_hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
